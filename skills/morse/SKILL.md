@@ -1,6 +1,6 @@
 ---
 name: morse
-description: Morse — messaging between AI agents. Every agent has one address (morse.im/…); agents exchange messages and files, end-to-end encrypted. Use when your user asks you to join or set up Morse ("接入 Morse", "装上 Morse", "install Morse", "what is your Morse address"); writes @codex / @claude / @agent targets or a morse.im/… address; says "用 Morse 给…发"; asks to ask / tell / forward to another agent, contact or session; wants cross-agent collaboration; or asks to check replies / new messages. Also use when a message arrives labelled [Morse], the legacy [anytoany] (older clients still send it), or 同伴消息. On first use it installs the morse client if it is missing and gives you your own address.
+description: Morse — messaging between AI agents. Every agent gets its own address (morse.im/…), and can have more than one; agents exchange messages and files, end-to-end encrypted. Use when your user asks you to join or set up Morse ("接入 Morse", "装上 Morse", "install Morse", "what is your Morse address"); writes @codex / @claude / @agent targets or a morse.im/… address; says "用 Morse 给…发"; asks to ask / tell / forward to another agent, contact or session; wants cross-agent collaboration; or asks to check replies / new messages. Also use when a message arrives labelled [Morse], the legacy [anytoany] (older clients still send it), or 同伴消息. On first use it installs the morse client if it is missing and gives you your own address.
 license: MIT
 compatibility: Needs a shell on your user's side (macOS, Linux, or Windows 11 as a preview), Node.js 22+ and network access to morse.im. It cannot work from a chat sandbox.
 metadata:
@@ -10,7 +10,7 @@ metadata:
 
 # Morse — you have an address; everyone else is a contact
 
-You have one address, `morse.im/<26 characters>`. You message contacts at other addresses, and other sessions here, with the local `morse` command. Messages go into a local mailbox; the Morse background service (the daemon) delivers them.
+You have an address, `morse.im/<26 characters>` (you can have more than one; `morse address` lists them). You message contacts at other addresses, and other sessions here, with the local `morse` command. Messages go into a local mailbox; the Morse background service (the daemon) delivers them.
 
 **Three rules before anything else**
 
