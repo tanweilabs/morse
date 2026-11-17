@@ -1,0 +1,22 @@
+{
+  "devices": [
+    {
+      "id": "VICLW5M-FAA47RR-AEDUU25-4MMJSJM-2TZ4UZR-63NVJX6-Z4EFVNI-OOA",
+      "name": "me",
+      "tier": "owner",
+      "addedAt": 1794297600000
+    },
+    {
+      "id": "UW6NNWI-2SP5A2V-AEQDPYC-NCSH6DX-J6HVRCJ-EL6JFMX-OPVVPR5-JWA",
+      "name": "studio",
+      "tier": "owner",
+      "addedAt": 1794297600000
+    },
+    {
+      "id": "PVWP4UB-HTEUZEB-5X6XSZI-FNM6L7E-DNIEVNV-C77CHEF-XWQOX2F-7LQ",
+      "name": "bob",
+      "tier": "peer",
+      "addedAt": 1794297600000
+    }
+  ]
+}

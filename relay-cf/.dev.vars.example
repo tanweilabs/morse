@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `wrangler dev` (never committed). In production use
+# `wrangler secret put ADMIN_KEY`. Leave ADMIN_KEY unset to disable the HTTP
+# allowlist API entirely (then manage the allowlist with `wrangler kv key put`).
+ADMIN_KEY=change-me-long-random-string

@@ -1,0 +1,44 @@
+{
+  "relay": {
+    "url": "ws://127.0.0.1:9",
+    "handle": "me",
+    "agent": "mini",
+    "agents": [
+      "mini",
+      "work"
+    ]
+  },
+  "plugins": {
+    "attendant": {
+      "groups": {
+        "colleague": {
+          "tools": [
+            "Read"
+          ],
+          "cwd": "/tmp/colleague"
+        }
+      },
+      "contacts": {
+        "bobby": {
+          "tools": [
+            "Read",
+            "Grep"
+          ],
+          "cwd": "/tmp/bob"
+        },
+        "erin": {
+          "tools": [
+            "Read"
+          ],
+          "cwd": "/tmp/erin"
+        },
+        "air": {
+          "tools": [
+            "Bash"
+          ],
+          "cwd": "/tmp/air"
+        }
+      }
+    }
+  }
+}

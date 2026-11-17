@@ -1,0 +1,254 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import { createDb } from '../src/mailbox/db.js';
+import { createMailbox, type Mailbox } from '../src/mailbox/mailbox.js';
+
+const CLAUDE_A = { agent: 'claude', sessionId: 'aaaa1111-0000-4000-8000-000000000001' };
+const CODEX_B = { agent: 'codex', sessionId: 'bbbb2222-0000-4000-8000-000000000002' };
+
+describe('mailbox', () => {
+  let mailbox: Mailbox;
+  let nowMs: number;
+
+  beforeEach(() => {
+    nowMs = 1_700_000_000_000;
+    mailbox = createMailbox(createDb(':memory:'), { now: () => nowMs });
+  });
+
+  describe('send & conversations', () => {
+    it('creates a message with pending status and self context id', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'hello' });
+      expect(m.status).toBe('pending');
+      expect(m.contextId).toBe(m.id);
+      expect(m.parts).toEqual([{ type: 'text', text: 'hello' }]);
+    });
+
+    it('reuses the same conversation for both directions (unordered pair)', () => {
+      const m1 = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'ping' });
+      const m2 = mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'pong' });
+      expect(m2.conversationId).toBe(m1.conversationId);
+      expect(mailbox.listConversations()).toHaveLength(1);
+    });
+
+    it('lists conversations with message count and last message', () => {
+      mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'first' });
+      nowMs += 1000;
+      mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'second' });
+      const convos = mailbox.listConversations();
+      expect(convos[0]?.messageCount).toBe(2);
+      expect(convos[0]?.lastMessage?.parts[0]?.text).toBe('second');
+      expect(convos[0]?.lastMessageAt).toBe(nowMs);
+    });
+  });
+
+  describe('reply', () => {
+    it('swaps from/to and inherits context and conversation', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'question' });
+      const r = mailbox.reply(m.id, 'answer');
+      expect(r.from).toEqual(CODEX_B);
+      expect(r.to).toEqual(CLAUDE_A);
+      expect(r.contextId).toBe(m.contextId);
+      expect(r.conversationId).toBe(m.conversationId);
+    });
+
+    it('throws for unknown message id', () => {
+      expect(() => mailbox.reply('nope', 'x')).toThrow(/not found/i);
+    });
+  });
+
+  describe('delivery state machine', () => {
+    it('claims pending → delivering, then delivered', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      const claimed = mailbox.claimNextPending();
+      expect(claimed?.id).toBe(m.id);
+      expect(claimed?.status).toBe('delivering');
+      expect(mailbox.claimNextPending()).toBeNull(); // nothing else pending
+      const done = mailbox.markDelivered(m.id);
+      expect(done.status).toBe('delivered');
+    });
+
+    it('failed under the retry limit is re-claimable only after the backoff window', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      mailbox.claimNextPending();
+      const failed = mailbox.markFailed(m.id, 'err 1');
+      expect(failed.status).toBe('failed');
+      expect(failed.attempts).toBe(1);
+      expect(failed.lastError).toBe('err 1');
+      expect(mailbox.claimNextPending()).toBeNull(); // within backoff — not yet retryable
+      nowMs += 31_000;
+      expect(mailbox.claimNextPending()?.id).toBe(m.id);
+    });
+
+    it('goes dead after 3 failed attempts and is no longer claimable', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      for (let i = 0; i < 3; i++) {
+        expect(mailbox.claimNextPending()?.id).toBe(m.id);
+        mailbox.markFailed(m.id, 'boom');
+        nowMs += 31_000; // pass the retry backoff window
+      }
+      expect(mailbox.getMessage(m.id)?.status).toBe('dead');
+      expect(mailbox.claimNextPending()).toBeNull();
+    });
+
+    it('rejects illegal transitions', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      expect(() => mailbox.markDelivered(m.id)).toThrow(/pending -> delivered/i); // must claim first
+    });
+
+    it('claimNextPending skips a live-monitored local target and claims the next instead', () => {
+      const m1 = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'to monitored codex' });
+      nowMs += 1000;
+      const m2 = mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'to claude' });
+      const claimed = mailbox.claimNextPending({ skip: (toSession) => toSession === CODEX_B.sessionId });
+      expect(claimed?.id).toBe(m2.id); // m1 skipped (codex is monitoring), m2 claimed
+      expect(mailbox.getMessage(m1.id)?.status).toBe('pending'); // left for the monitor to pull
+    });
+
+    it('claimNextPending returns null when the only claimable message is skipped', () => {
+      mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      expect(mailbox.claimNextPending({ skip: (s) => s === CODEX_B.sessionId })).toBeNull();
+    });
+
+    it('skip sees the device, so remote targets are never treated as locally monitored', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: { ...CODEX_B, device: 'mini' }, text: 'remote' });
+      const claimed = mailbox.claimNextPending({ skip: (s, d) => !d && s === CODEX_B.sessionId });
+      expect(claimed?.id).toBe(m.id); // remote relayed as usual
+    });
+  });
+
+  describe('inbox', () => {
+    it('lists undelivered messages for a recipient session, take marks delivered', () => {
+      mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'for codex' });
+      mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'for claude' });
+      const forCodex = mailbox.inbox({ toSession: CODEX_B.sessionId });
+      expect(forCodex).toHaveLength(1);
+      expect(forCodex[0]?.parts[0]?.text).toBe('for codex');
+
+      const taken = mailbox.inbox({ toSession: CODEX_B.sessionId, take: true });
+      expect(taken).toHaveLength(1);
+      expect(mailbox.inbox({ toSession: CODEX_B.sessionId })).toHaveLength(0);
+      expect(mailbox.getMessage(taken[0]!.id)?.status).toBe('delivered');
+    });
+  });
+
+  describe('web console support', () => {
+    it('lists messages of a conversation in chronological order', () => {
+      const m1 = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'one' });
+      nowMs += 1000;
+      mailbox.reply(m1.id, 'two');
+      const msgs = mailbox.listMessages(m1.conversationId);
+      expect(msgs.map((m) => m.parts[0]?.text)).toEqual(['one', 'two']);
+      expect(mailbox.listMessages('nonexistent')).toEqual([]);
+    });
+
+    it('retry requeues a failed/dead message with attempts reset', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      for (let i = 0; i < 3; i++) {
+        mailbox.claimNextPending();
+        mailbox.markFailed(m.id, 'boom');
+        nowMs += 31_000;
+      }
+      expect(mailbox.getMessage(m.id)?.status).toBe('dead');
+      const retried = mailbox.retry(m.id);
+      expect(retried.status).toBe('pending');
+      expect(retried.attempts).toBe(0);
+      expect(mailbox.claimNextPending()?.id).toBe(m.id);
+    });
+
+    it('retry rejects non-failed messages', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      expect(() => mailbox.retry(m.id)).toThrow(/only failed/i);
+    });
+  });
+
+  describe('crash recovery', () => {
+    it('requeues messages stranded in delivering by a dead daemon', () => {
+      const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      mailbox.claimNextPending(); // daemon claims, then "crashes"
+      expect(mailbox.claimNextPending()).toBeNull(); // stranded — nothing claimable
+      const recovered = mailbox.recoverStale();
+      expect(recovered).toBe(1);
+      nowMs += 31_000; // failed path respects the retry backoff
+      expect(mailbox.claimNextPending()?.id).toBe(m.id);
+    });
+
+    it('is a no-op when nothing is stranded', () => {
+      mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: 'x' });
+      expect(mailbox.recoverStale()).toBe(0);
+    });
+  });
+
+  describe('no loop caps in the mailbox (ADR-072)', () => {
+    it('a thread can go deep and fast — the tool does not police agent conversations', () => {
+      let m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text: '0' });
+      for (let i = 1; i < 250; i++) {
+        nowMs += 10;
+        m = mailbox.reply(m.id, `${i}`);
+      }
+      expect(mailbox.listMessages(m.conversationId).filter((x) => x.contextId === m.contextId)).toHaveLength(250);
+    });
+  });
+});
+
+describe('three-party context — user piggyback on an agent pair thread', () => {
+  const A = { agent: 'codex', sessionId: 'aaaa1111-0000-4000-8000-000000000001' };
+  const B = { agent: 'zcode', sessionId: 'sess_bbbb2222-0000-4000-8000-000000000002', device: 'mini' };
+  const USER = { agent: 'user', sessionId: 'cli' };
+
+  it('explicit conversationId keeps user messages AND their replies in the pair thread', () => {
+    const mailbox = createMailbox(createDb(':memory:'));
+    const seed = mailbox.send({ from: A, to: B, text: 'kickoff' });
+    const um = mailbox.send({ from: USER, to: B, text: 'boss instruction', conversationId: seed.conversationId });
+    expect(um.conversationId).toBe(seed.conversationId);
+    const r = mailbox.reply(um.id, 'ok boss');
+    expect(r.conversationId).toBe(seed.conversationId);
+    expect(mailbox.listConversations()).toHaveLength(1);
+    expect(mailbox.listMessages(seed.conversationId)).toHaveLength(3);
+  });
+
+  it('rejects an unknown conversationId instead of silently forking', () => {
+    const mailbox = createMailbox(createDb(':memory:'));
+    expect(() =>
+      mailbox.send({ from: USER, to: A, text: 'x', conversationId: 'no-such-conversation' }),
+    ).toThrow(/not found/);
+  });
+});
+
+describe('delivered-in-session flag (2026-10-20)', () => {
+  it('persists and round-trips; defaults to absent', async () => {
+    const { createDb } = await import('../src/mailbox/db.js');
+    const { createMailbox } = await import('../src/mailbox/mailbox.js');
+    const mb = createMailbox(createDb(':memory:'));
+    const a = mb.send({ from: { agent: 'claude', sessionId: 'a' }, to: { agent: 'codex', sessionId: 'b' }, text: 'x' });
+    mb.claimNextPending();
+    expect(mb.markDelivered(a.id, { inSession: true }).deliveredInSession).toBe(true);
+    expect(mb.getMessage(a.id)?.deliveredInSession).toBe(true);
+    const b = mb.send({ from: { agent: 'claude', sessionId: 'a' }, to: { agent: 'codex', sessionId: 'b' }, text: 'y' });
+    mb.claimNextPending();
+    expect(mb.markDelivered(b.id).deliveredInSession).toBeUndefined();
+  });
+});
+
+describe('mailbox — Morse message requests, sender side (ADR-037)', () => {
+  it('markRequest / requestPendingHandles / requestAccepted: marks cleared, held messages to that person retried at once', () => {
+    let now = 1_700_000_000_000;
+    const mb = createMailbox(createDb(':memory:'), { now: () => now, waitRetryMs: 30_000 });
+    const from = { agent: 'claude', sessionId: 's' };
+    const first = mb.send({ from, to: { agent: 'user', sessionId: '', device: 'bob' }, text: 'first' });
+    const held = mb.send({ from, to: { agent: 'mbp', sessionId: '', device: 'bob/mbp' }, text: 'held' });
+    const other = mb.send({ from, to: { agent: 'user', sessionId: '', device: 'bobby' }, text: 'other person' });
+    expect(mb.markRequest(first.id)).toBe(true);
+    expect(mb.getMessage(first.id)?.request).toBe(true);
+    expect(mb.requestPendingHandles()).toEqual(['bob']);
+    for (const m of [first, held, other]) {
+      mb.claimNextPending();
+      if (m.id === first.id) mb.markDelivered(m.id);
+      else mb.markFailed(m.id, 'waiting for morse.talk/x to accept', { waiting: true });
+    }
+    expect(mb.claimNextPending()).toBeNull(); // not due yet (30 s)
+    expect(mb.requestAccepted('BOB')).toBe(1); // held → due now; "bobby" untouched
+    expect(mb.getMessage(first.id)?.request).toBeUndefined();
+    expect(mb.requestPendingHandles()).toEqual([]);
+    expect(mb.claimNextPending()?.id).toBe(held.id);
+    expect(mb.claimNextPending()).toBeNull();
+  });
+});

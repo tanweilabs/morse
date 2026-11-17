@@ -1,0 +1,104 @@
+# Morse relay on Cloudflare Workers. Self-hosting: docs/guides/self-host-relay.zh-CN.md.
+#
+# `wrangler dev` runs everything locally (workerd + simulated KV / Durable Objects);
+# `wrangler deploy` publishes. Before deploying, fill in the KV namespace id below
+# (`wrangler kv namespace create ALLOWLIST`) and set the admin secret
+# (`wrangler secret put ADMIN_KEY`) if you want the HTTP allowlist API.
+
+name = "morse-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-10-01"
+workers_dev = true
+# Custom domain (optional; its zone must be active in your Cloudflare account). Without it the
+# relay answers on <name>.<your subdomain>.workers.dev (workers_dev = true).
+# routes = [
+#   { pattern = "relay.example.com", custom_domain = true },
+# ]
+
+[observability]
+enabled = true
+
+[vars]
+# Largest envelope (ciphertext JSON) the relay forwards. Cloudflare caps a single
+# WebSocket message at 1 MiB, so this must stay below 1_048_576 minus framing.
+MAX_BLOB_BYTES = "1000000"
+# Sends per device per minute (token bucket; burst = the same number).
+RATE_PER_MINUTE = "120"
+# Open registration (ADR-036): `morse join` with no code gets a new random handle.
+# "0" closes it (then only admin invites let people in).
+OPEN_REGISTRATION = "1"
+# New random handles one client IP (CF-Connecting-IP) may get per hour.
+REGISTER_PER_IP_PER_HOUR = "20"
+# v3 (identity v3): `send` frames one client IP (CF-Connecting-IP) may make per minute, over
+# ALL its connections together (token bucket; burst = the same number). Several computers
+# behind one NAT sending file chunks at full rate stay under it. "0" = off (then the IpBucket
+# objects below are never called). Only a hash of the IP is used, and nothing is stored.
+V3_RATE_PER_IP_PER_MINUTE = "600"
+# Extra reserved handles, comma separated (the built-in list — admin, root, support, … —
+# is in src/protocol.ts and always applies).
+RESERVED_HANDLES = ""
+
+# Device allowlist + handle directory: key = device ID (XXXXXXX-XXXXXXX-…), value =
+# {"handle": "…", "name": "…"}; key = "@<handle>", value = [device IDs].
+[[kv_namespaces]]
+binding = "ALLOWLIST"
+# your own: `npx wrangler kv namespace create ALLOWLIST` prints it (wrangler dev runs without)
+id = "<YOUR_KV_NAMESPACE_ID>"
+
+# One Durable Object per device ID holds that device's live WebSocket(s) and its
+# signed encryption-key bundle. Nothing else is stored.
+[[durable_objects.bindings]]
+name = "DEVICE_HUB"
+class_name = "DeviceHub"
+
+# One object (idFromName "invites") holds every invite — strongly consistent, so a
+# one-use invite code really is redeemable once (ADR-032). Codes are stored hashed.
+# Since ADR-036 it also hands out random handles (open registration), keeps the
+# one-time pairing codes for adding a computer and the per-IP registration counters
+# — new keys in the same object, so no migration.
+[[durable_objects.bindings]]
+name = "INVITES"
+class_name = "InviteBook"
+
+# One object per person (idFromName(<handle>)) holds that person's agent directory:
+# morse.im/<handle>/<agent> → the one device hosting it, plus the default agent
+# (ADR-033). Strongly consistent, so names are unique and renames are atomic.
+# Also holds the person's display nickname (ADR-036, key "profile").
+[[durable_objects.bindings]]
+name = "AGENTS"
+class_name = "AgentBook"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeviceHub"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["InviteBook"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["AgentBook"]
+
+# Identity v3 (ADR-073): one object per address (idFromName(<26-char address>)) — its public
+# key + signed prekeys, the live connection of the computer hosting it, and its offline
+# mailbox (sealed envelopes, ≤ 7 days, deleted once fetched). SQLite-backed.
+[[durable_objects.bindings]]
+name = "ADDRESS_HUB"
+class_name = "AddressHub"
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["AddressHub"]
+
+# One object per client IP (idFromName(<hash of the IP>): the object never learns the IP)
+# holds the v3 send tokens every connection from that IP shares (V3_RATE_PER_IP_PER_MINUTE).
+# Connections lease tokens in batches of 20, so it is called once per 20 sends, not per
+# message. In memory only: no storage is written (an evicted object comes back full).
+[[durable_objects.bindings]]
+name = "IP_BUCKET"
+class_name = "IpBucket"
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["IpBucket"]

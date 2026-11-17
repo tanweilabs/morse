@@ -1,0 +1,55 @@
+name: CI Windows
+
+# Opt-in Windows coverage (ADR-080; cost policy ADR-015). NOT on push or pull request —
+# Windows runners bill at 2x. Weekly and on demand only, and only a SUBSET of the suite: the
+# tests written for the Windows code paths plus a syntax check of site/install.ps1. The rest
+# of the suite still assumes POSIX (file modes, symlinks, /bin/sh) — phase 6 of ADR-080.
+#
+# Budget (CLAUDE.md rule 7): about 5 minutes a run, billed 2x = ~10 minutes; one run a week
+# is ~45 billed minutes a month. A manual run costs the same ~10.
+#
+# What this cannot show: that Morse installs and runs on a real Windows 11 with Claude Code
+# and Codex — that is the checklist in docs/guides/windows.zh-CN.md.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * 1' # Mondays 03:30 UTC
+
+concurrency:
+  group: ci-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node 22 / windows (subset)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # the two native modules (better-sqlite3, node-datachannel) must install from prebuilt binaries
+      - run: npm ci
+      - run: npm run build
+      - name: site/install.ps1 parses in Windows PowerShell 5.1 (what "irm | iex" users have)
+        shell: powershell
+        run: |
+          $errors = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path site/install.ps1).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_.ToString() }; throw "site/install.ps1: $($errors.Count) parse error(s)" }
+          Write-Host 'site/install.ps1 parses (Windows PowerShell 5.1)'
+      - name: site/install.ps1 parses in PowerShell 7
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path site/install.ps1).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_.ToString() }; throw "site/install.ps1: $($errors.Count) parse error(s)" }
+          Write-Host 'site/install.ps1 parses (PowerShell 7)'
+      # the Windows subset: keep this list in step with docs/specs/windows-native.zh-CN.md (4.1)
+      - name: tests (Windows subset)
+        run: npx vitest run test/platform.test.ts test/setup-windows.test.ts test/install-ps1.test.ts test/text-file.test.ts test/ci-policy.test.ts test/sanity.test.ts test/envelope.test.ts

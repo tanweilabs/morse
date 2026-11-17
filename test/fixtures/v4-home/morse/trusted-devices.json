@@ -1,0 +1,40 @@
+{
+  "devices": [
+    {
+      "id": "NT5CZKK-Y5HERZV-Z5XNUL5-AZSNKIU-AFS3GC4-SEZW5AL-NRMQJJI-V2A",
+      "name": "me",
+      "tier": "owner",
+      "addedAt": 1794729600000
+    },
+    {
+      "id": "Y2TVS63-U3ASAK5-5D73OPY-JXR5KAO-5LO5ME3-2YOK3MR-O42NZ6A-6DA",
+      "name": "me",
+      "tier": "owner",
+      "addedAt": 1794729600000
+    },
+    {
+      "id": "H2VDRUR-VCMZBFR-VIFKLMR-75SE35G-BVRQIXS-U2ZNRTS-6C6B7K2-UHQ",
+      "name": "studio",
+      "tier": "owner",
+      "addedAt": 1794729600000
+    },
+    {
+      "id": "BXKSFHG-P2A4D3T-VULBCKZ-WEJT4T5-BZOOAWH-RQ5Y76I-3LXAG4X-BMQ",
+      "name": "bob",
+      "tier": "peer",
+      "addedAt": 1794729600000
+    },
+    {
+      "id": "SVK5KTZ-BTIYJR5-YVJVHDQ-ZOYETFF-7HJI3SS-JW5UO5T-ECTKAAT-Z5A",
+      "name": "carl",
+      "tier": "peer",
+      "addedAt": 1794729600000
+    },
+    {
+      "id": "JEC3WM3-Y25D2VK-MJD44UX-2BAGD5U-CVGTTDV-NS7RQDX-IEZMULP-JXQ",
+      "name": "lee",
+      "tier": "peer",
+      "addedAt": 1794729600000
+    }
+  ]
+}

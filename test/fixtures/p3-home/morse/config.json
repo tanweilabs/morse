@@ -1,0 +1,12 @@
+{
+  "relay": {
+    "url": "ws://127.0.0.1:9",
+    "handle": "me",
+    "agent": "mini",
+    "agents": [
+      "mini",
+      "work",
+      "lab"
+    ]
+  }
+}

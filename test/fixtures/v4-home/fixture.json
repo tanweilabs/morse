@@ -1,0 +1,99 @@
+{
+  "builtBy": "1afe17e",
+  "userVersion": 4,
+  "t0": 1794729600000,
+  "lastAt": 1794729676000,
+  "mine": {
+    "first": "sh9rqdjwbyrgm7h75qrqm8qnam",
+    "work": "6gk2f8h8cbtwknmgpgkgmzkdwn",
+    "device": "FGLQ67I-YSNWTCQ-UAJXRZ3-3K3CJN5-JW2IBO4-ZRSUYHA-Q4QOLH5-CIQ"
+  },
+  "peers": {
+    "ann": "aqch7sbrd856v467hzzm52jskw",
+    "nina": "jthgcfqmr5fn2kbrx83zmeqd8f",
+    "rob": "62phy3wcp8v8yr4wbde2se5f2b"
+  },
+  "devices": {
+    "myAir": {
+      "id": "NT5CZKK-Y5HERZV-Z5XNUL5-AZSNKIU-AFS3GC4-SEZW5AL-NRMQJJI-V2A",
+      "address": "ea6fds992hajs5dtx4qd2ec66w"
+    },
+    "myWin": {
+      "id": "Y2TVS63-U3ASAK5-5D73OPY-JXR5KAO-5LO5ME3-2YOK3MR-O42NZ6A-6DA",
+      "address": "am7z2dfcterbzrw94j6p7nkw6e"
+    },
+    "studio": {
+      "id": "H2VDRUR-VCMZBFR-VIFKLMR-75SE35G-BVRQIXS-U2ZNRTS-6C6B7K2-UHQ",
+      "address": "ss2scqwy6w6yz526bfpfpnsatf"
+    },
+    "bob": {
+      "id": "BXKSFHG-P2A4D3T-VULBCKZ-WEJT4T5-BZOOAWH-RQ5Y76I-3LXAG4X-BMQ",
+      "address": "q4mhfsfr984yevkknmbapy539e"
+    },
+    "aliceMini": {
+      "id": "V4ZYHXT-L4REEOY-ZDPI74L-LNJ36E2-ODN3YP2-5XOGYZ7-AIOGFRZ-RUQ",
+      "address": "3byjajqawt5pp9n93axbrg2bb6"
+    },
+    "aliceAir": {
+      "id": "OCJQMTU-YUZEGCT-RY7AEBN-YX7QUKX-O2WR6JM-LKHXIE5-ZFKBBUS-ATQ",
+      "address": "x3rxba8qqspmh7mtvc23xpqzk4"
+    },
+    "erin": {
+      "id": "PKRWSVS-W4X7KVM-MBOPAGM-CFW7BP7-K4TLECC-4II7IQJ-Q3PILXU-VBQ",
+      "address": "h6dy6p2r24nt6qxe9vd2pavfkx"
+    },
+    "carl": {
+      "id": "SVK5KTZ-BTIYJR5-YVJVHDQ-ZOYETFF-7HJI3SS-JW5UO5T-ECTKAAT-Z5A",
+      "address": "pg5emajm6ed4gg9efb323qbvpv"
+    },
+    "lee": {
+      "id": "JEC3WM3-Y25D2VK-MJD44UX-2BAGD5U-CVGTTDV-NS7RQDX-IEZMULP-JXQ",
+      "address": "qjqwktfzm8222n3qmpd9m6njtz"
+    },
+    "carol": {
+      "id": "QZKAT5B-MZOMN6K-MVNPRYZ-NBUIBAF-IQNHOIG-76TEO3F-HXVFULZ-EOA",
+      "address": "5h4wjqrmqqk5gay4htb463yzvt"
+    },
+    "gail": {
+      "id": "O36IART-PNDRYQH-5LYCJRV-RGSRFVV-THFMWP3-3KJ6KRP-4QVSW4D-PAA",
+      "address": "m48dzte2qx25yftmeymxg842c2"
+    }
+  },
+  "contacts": {
+    "me": "self",
+    "air": "a:ea6fds992hajs5dtx4qd2ec66w",
+    "alice": "c:alice",
+    "alice/air": "c:alice/air",
+    "Ann": "a:aqch7sbrd856v467hzzm52jskw",
+    "Bobby": "c:bob",
+    "Carl": "c:carl",
+    "dave": "c:dave",
+    "erin": "c:erin",
+    "eve": "c:eve",
+    "lee": "c:lee",
+    "nina": "a:jthgcfqmr5fn2kbrx83zmeqd8f",
+    "studio": "a:ss2scqwy6w6yz526bfpfpnsatf",
+    "win": "a:am7z2dfcterbzrw94j6p7nkw6e"
+  },
+  "messages": {
+    "fromAir": "d244a764-1fd7-4f7a-bda7-423768a6d495",
+    "toWin": "d7a950d0-1fe3-458c-aff2-e7f667595511",
+    "internal": "62259fab-3d2d-47ac-8114-5b3590139cb6",
+    "toBob": "033c606a-2f04-44ad-a4d5-d14a746ab049",
+    "fromBob": "a3374848-0d06-4b02-ae7b-42aeb25c7534",
+    "bobThread": "fba84ab7-ecba-4631-bf1a-0c982b23fc99",
+    "bobThreadReply": "3d29c88b-ab7b-4656-8517-61c14e1679f2",
+    "fromAliceMini": "36e09bb4-6268-4fee-9f93-f999976f0ac3",
+    "fromAliceAir": "7df20a1d-0f6f-47a3-802a-0e4d9b3d7b3f",
+    "fromErin": "22bf8b8a-8ae4-44bf-95fd-a8ef31129f50",
+    "fromCarl": "9b7701c5-bd4b-4644-a6cf-c4dd1389992d",
+    "fromEve": "388e3064-9db2-4a4c-b1a3-c0667ebff9c0",
+    "fromLee": "95086a74-0681-45b1-a7e1-73fe12ad3aeb",
+    "fromAnn": "f5db1386-32fa-4abf-b967-dc9f6663ce67",
+    "toAnn": "2d7c222e-256b-4d64-9ff5-f434448725a9",
+    "toAirWaiting": "af42d845-e1cc-4d12-9f7d-8785ff76dc1b",
+    "waitingBob": "63ee2393-ab1c-4490-91fc-123d399411c9",
+    "toCarlWaiting": "25238c6b-f22e-4ca0-802e-97d103b494d3",
+    "toDave": "61f7566d-d8f3-474f-8447-d5ecd15098fe"
+  }
+}

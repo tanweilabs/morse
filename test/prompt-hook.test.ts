@@ -1,0 +1,221 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { collectInbox, processPromptHook, recentExchange } from '../src/hooks/prompt-hook.js';
+import { createDb } from '../src/mailbox/db.js';
+import { createMailbox, type Mailbox } from '../src/mailbox/mailbox.js';
+
+const CLAUDE_A = { agent: 'claude', sessionId: 'aaaa1111-0000-4000-8000-000000000001' };
+const CODEX_B = { agent: 'codex', sessionId: 'bbbb2222-0000-4000-8000-000000000002' };
+
+const home = mkdtempSync(join(tmpdir(), 'anytoany-hook-'));
+afterAll(() => rmSync(home, { recursive: true, force: true }));
+
+describe('prompt hook (claude + codex shared)', () => {
+  let mailbox: Mailbox;
+  let nowMs: number;
+
+  beforeEach(() => {
+    nowMs = 1_700_000_000_000;
+    mailbox = createMailbox(createDb(':memory:'), { now: () => nowMs });
+  });
+
+  const run = (sessionId: string) =>
+    processPromptHook(mailbox, { session_id: sessionId }, { home, now: () => nowMs });
+
+  it('returns empty when nothing waiting and no new activity', () => {
+    expect(run(`empty-${nowMs}`)).toEqual({});
+  });
+
+  it('injects pending messages fully and marks them delivered', () => {
+    const m = mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'tests green on my side' });
+    const out = run(CLAUDE_A.sessionId);
+    const ctx = out.hookSpecificOutput?.additionalContext ?? '';
+    expect(ctx).toContain('tests green on my side');
+    expect(ctx).toContain(`anyd reply ${m.id}`);
+    expect(mailbox.getMessage(m.id)?.status).toBe('delivered');
+  });
+
+  it('does not steal messages the dispatcher is delivering', () => {
+    const m = mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'in flight' });
+    mailbox.claimNextPending();
+    const out = run(CLAUDE_A.sessionId);
+    expect(out.hookSpecificOutput?.additionalContext ?? '').not.toContain('in flight');
+    expect(mailbox.getMessage(m.id)?.status).toBe('delivering');
+  });
+
+  it('shows already-handled traffic as an FYI digest exactly once (cursor)', () => {
+    const sid = `codex-app-${nowMs}`;
+    const m = mailbox.send({ from: CLAUDE_A, to: { agent: 'codex', sessionId: sid }, text: 'run the tests please' });
+    mailbox.claimNextPending();
+    mailbox.markDelivered(m.id); // headless resume already handled it
+    nowMs += 1000;
+
+    const out = run(sid);
+    const ctx = out.hookSpecificOutput?.additionalContext ?? '';
+    expect(ctx).toContain('Activity digest');
+    expect(ctx).toContain('run the tests please');
+    expect(ctx).toMatch(/ALREADY processed/);
+    expect(ctx).toMatch(/do NOT reply/);
+
+    nowMs += 1000;
+    expect(run(sid)).toEqual({}); // second prompt — digest not repeated
+  });
+
+  it('digest covers both directions (received and sent replies)', () => {
+    const sid = `codex-app2-${nowMs}`;
+    const m = mailbox.send({ from: CLAUDE_A, to: { agent: 'codex', sessionId: sid }, text: 'question' });
+    mailbox.claimNextPending();
+    mailbox.markDelivered(m.id);
+    const r = mailbox.reply(m.id, 'the answer');
+    mailbox.claimNextPending();
+    mailbox.markDelivered(r.id);
+    nowMs += 1000;
+
+    const ctx = run(sid).hookSpecificOutput?.additionalContext ?? '';
+    expect(ctx).toContain('← received');
+    expect(ctx).toContain('→ sent to');
+  });
+
+  it('handles missing session id gracefully', () => {
+    expect(processPromptHook(mailbox, {}, { home })).toEqual({});
+  });
+
+  it('frames injected messages as a trusted teammate (ADR-016), not external data', () => {
+    mailbox.send({ from: CODEX_B, to: CLAUDE_A, text: 'please run tests' });
+    const ctx = run(CLAUDE_A.sessionId).hookSpecificOutput?.additionalContext ?? '';
+    expect(ctx).toMatch(/trusted teammate|ADR-016/i);
+    expect(ctx).not.toMatch(/treat as external data/i);
+    expect(ctx).toContain('[Morse] Cross-agent message from');
+    expect(ctx).not.toContain('anytoany');
+  });
+});
+
+describe('collectInbox (shared by hook and `anyd pull`)', () => {
+  let mailbox: Mailbox;
+  let nowMs: number;
+  beforeEach(() => {
+    nowMs = 1_700_000_000_000;
+    mailbox = createMailbox(createDb(':memory:'), { now: () => nowMs });
+  });
+
+  it('recentExchange shows the full recent exchange both directions incl. dead, ignoring the cursor', () => {
+    let t = 1_700_000_000_000;
+    const mb = createMailbox(createDb(':memory:'), { now: () => t });
+    const SID = 'sess-hist';
+    const CLAUDE = { agent: 'claude', sessionId: 'claude-x' };
+    const m1 = mb.send({ from: CLAUDE, to: { agent: 'codex', sessionId: SID }, text: 'please review PR 42' });
+    mb.claimNextPending();
+    mb.markDelivered(m1.id);
+    t += 1000;
+    const r = mb.reply(m1.id, 'DONE reviewed');
+    mb.claimNextPending();
+    mb.markDelivered(r.id);
+    t += 1000;
+    const m2 = mb.send({ from: CLAUDE, to: { agent: 'codex', sessionId: SID }, text: 'timed-out long message' });
+    for (let i = 0; i < 3; i++) {
+      mb.claimNextPending();
+      mb.markFailed(m2.id, 'timeout');
+      t += 31_000;
+    }
+    const out = recentExchange(mb, SID, 15) ?? '';
+    expect(out).toContain('please review PR 42'); // received, full text
+    expect(out).toContain('DONE reviewed'); // sent reply, full text
+    expect(out).toContain('timed-out long message'); // the dead one is shown
+    expect(out).toMatch(/dead|never reached/i); // and flagged as undelivered
+    expect(recentExchange(createMailbox(createDb(':memory:')), 'nobody')).toBeNull();
+  });
+
+  it('returns pending text and takes the message; null when nothing new', () => {
+    const sid = `pull-${nowMs}`;
+    const m = mailbox.send({ from: CLAUDE_A, to: { agent: 'codex', sessionId: sid }, text: 'peer needs a review' });
+    const text = collectInbox(mailbox, sid, { home, now: () => nowMs });
+    expect(text).toContain('peer needs a review');
+    expect(text).toContain(`anyd reply ${m.id}`);
+    expect(mailbox.getMessage(m.id)?.status).toBe('delivered'); // taken
+    nowMs += 1000;
+    expect(collectInbox(mailbox, sid, { home, now: () => nowMs })).toBeNull(); // nothing new now
+  });
+
+  it('recovers a message that dead-lettered on failed headless delivery, marks it seen, no repeat', () => {
+    const sid = `recover-${nowMs}`;
+    // a reply addressed to this session that fails headless delivery 3x → dead
+    // (root cause: `claude -p --resume` can fail on a live/huge session; the daemon
+    // gives up and dead-letters, and the message would otherwise be lost forever)
+    const m = mailbox.send({ from: CLAUDE_A, to: { agent: 'codex', sessionId: sid }, text: 'DONE b04583b pushed' });
+    for (let i = 0; i < 3; i++) {
+      mailbox.claimNextPending();
+      mailbox.markFailed(m.id, 'claude -p --resume exited 1');
+      nowMs += 31_000;
+    }
+    expect(mailbox.getMessage(m.id)?.status).toBe('dead');
+
+    // the pull hook is the reliable fallback for interactive sessions — it must still
+    // surface the dead-lettered message and mark it seen, instead of losing it
+    const text = collectInbox(mailbox, sid, { home, now: () => nowMs });
+    expect(text).toContain('DONE b04583b pushed');
+    expect(text).toMatch(/couldn'?t be delivered|never reached|recovered|failed to push/i);
+    expect(mailbox.getMessage(m.id)?.status).toBe('delivered'); // recovered = seen
+
+    nowMs += 1000;
+    expect(collectInbox(mailbox, sid, { home, now: () => nowMs })).toBeNull(); // not repeated
+  });
+  it('a version-mismatch dead letter is surfaced as an ERROR to relay, not a quiet recovery (ADR-025)', () => {
+    const sid = `vmismatch-${nowMs}`;
+    const m = mailbox.send({ from: CLAUDE_A, to: { agent: 'codex', sessionId: sid }, text: 'video fix shipped' });
+    mailbox.claimNextPending();
+    mailbox.markFailed(
+      m.id,
+      'version_mismatch: the codex CLI Morse delivers with (codex-cli 0.157.1) is older than the Codex Desktop that last wrote this session (0.162.0-alpha.17.2). … upgrade: npm i -g @openai/codex@latest …',
+      { terminal: true },
+    );
+    const text = collectInbox(mailbox, sid, { home, now: () => nowMs }) ?? '';
+    expect(text).toContain('video fix shipped'); // still not lost
+    expect(text).toMatch(/version mismatch/i);
+    expect(text).toContain('npm i -g @openai/codex@latest'); // the fix, verbatim
+    expect(text).toMatch(/tell the (user|operator)/i); // the agent must relay it
+    expect(text).not.toMatch(/Nothing was lost/); // not the soothing generic banner
+  });
+});
+
+// 2026-10-20 incident: 7 of 9 messages queued into Codex Desktop since ADR-027 were
+// answered with "already processed in the background, not repeating" and never done.
+// The queued turn fired the prompt hook, whose FYI digest listed THAT VERY MESSAGE as
+// "ALREADY processed automatically in headless turns; do NOT act" — because queueing
+// marks it delivered. A message delivered INTO the session's own runtime is the turn
+// itself, never a background leftover.
+describe('digest never tells a session to ignore the message it is running (2026-10-20)', () => {
+  let mailbox: Mailbox;
+  let nowMs = 1_800_000_000_000;
+  beforeEach(() => {
+    mailbox = createMailbox(createDb(':memory:'), { now: () => nowMs });
+    nowMs += 10_000;
+  });
+
+  const deliver = (text: string, inSession: boolean) => {
+    const m = mailbox.send({ from: CLAUDE_A, to: CODEX_B, text });
+    mailbox.claimNextPending();
+    return mailbox.markDelivered(m.id, inSession ? { inSession: true } : undefined);
+  };
+
+  it('a message delivered inside the session (codex queue / zcode mailbox) is NOT in the digest', () => {
+    const queued = deliver('[设备空间清理] 请核对并收掉 musely 用不上的工作副本', true);
+    expect(queued.deliveredInSession).toBe(true);
+    const text = collectInbox(mailbox, CODEX_B.sessionId, { home, now: () => nowMs }) ?? '';
+    expect(text).not.toContain('设备空间清理');
+    expect(text).not.toMatch(/ALREADY processed/);
+  });
+
+  it('a message genuinely handled in a separate headless turn still shows as FYI', () => {
+    deliver('handled by exec resume', false);
+    expect(collectInbox(mailbox, CODEX_B.sessionId, { home, now: () => nowMs }) ?? '').toContain('handled by exec resume');
+  });
+
+  it('belt and braces: a message whose id is in the current prompt is never listed as done', () => {
+    const m = deliver('the envelope being run right now', false);
+    const prompt = `[Morse] Message from @claude:x (message id: ${m.id}).\n--- MESSAGE ---\nthe envelope being run right now`;
+    const out = processPromptHook(mailbox, { session_id: CODEX_B.sessionId, prompt }, { home, now: () => nowMs });
+    expect(out.hookSpecificOutput?.additionalContext ?? '').not.toContain('the envelope being run right now');
+  });
+});

@@ -1,0 +1,18 @@
+{
+  "name": "morse-relay-cf",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Morse relay on Cloudflare Workers + Durable Objects: forwards end-to-end encrypted envelopes between allowlisted devices in real time. Stores no messages.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.151.3"
+  }
+}
