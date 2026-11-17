@@ -1,200 +1,160 @@
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createZcodeAdapter } from '../src/adapters/zcode.js';
 import {
   isSessionBusy,
   mailboxEnabledFor,
   mailboxRoot,
   postToMailbox,
   reclaimMail,
+  type MailboxEnvelope,
 } from '../src/adapters/zcode-mailbox.js';
-import type { ExecFn, SessionInfo } from '../src/adapters/types.js';
 
-const SID = 'sess_149a52e6-713e-4939-bfd5-240cc9bea10d';
-const dirs: string[] = [];
-const tmp = (p: string) => {
-  const d = mkdtempSync(join(tmpdir(), p));
-  dirs.push(d);
-  return d;
+const SID = 'sess_0c4f2a7e-91b3-4d65-a8e0-7b1c2d3e4f50';
+const made: string[] = [];
+afterAll(() => made.forEach((d) => rmSync(d, { recursive: true, force: true })));
+const freshRoot = () => {
+  const created = mkdtempSync(join(tmpdir(), 'morse-zmailbox-'));
+  made.push(created);
+  return created;
 };
-afterAll(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+const letter = (patch: Partial<MailboxEnvelope> = {}): MailboxEnvelope => ({
+  messageId: 'msg-1',
+  fromSessionId: 'anytoany',
+  toSessionId: SID,
+  content: 'hello zcode',
+  createdAt: '2026-11-16T08:00:00.000Z',
+  ...patch,
+});
 
-describe('ZCode mailbox files (format from ZCode source, ADR-029)', () => {
-  it('root honours ZCODE_MAILBOX_ROOT, else ~/.zcode/mailbox', () => {
-    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: '/x/mb' }, '/home/u')).toBe('/x/mb');
-    expect(mailboxRoot({}, '/home/u')).toBe('/home/u/.zcode/mailbox');
-    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: '~/mb' }, '/home/u')).toBe('/home/u/mb');
+describe('where the mailbox lives', () => {
+  it('ZCODE_MAILBOX_ROOT when set (with ~ expanded), otherwise ~/.zcode/mailbox', () => {
+    expect(mailboxRoot({}, '/Users/me')).toBe('/Users/me/.zcode/mailbox');
+    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: '/var/mail/zc' }, '/Users/me')).toBe('/var/mail/zc');
+    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: '~/inbox/zc' }, '/Users/me')).toBe('/Users/me/inbox/zc');
+    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: '~' }, '/Users/me')).toBe('/Users/me');
+    expect(mailboxRoot({ ZCODE_MAILBOX_ROOT: 'relative/~/x' }, '/Users/me')).toBe('relative/~/x');
   });
 
-  it('a session counts as mailbox-enabled once ZCode itself created its unread/ dir', () => {
-    const root = tmp('anyd-zmb-');
-    expect(mailboxEnabledFor(root, SID)).toBe(false);
-    mkdirSync(join(root, SID, 'unread'), { recursive: true });
-    expect(mailboxEnabledFor(root, SID)).toBe(true);
-  });
-
-  it('posts a version-1 envelope atomically into unread/ (no temp file left behind)', () => {
-    const root = tmp('anyd-zmb-');
-    const path = postToMailbox(root, {
-      messageId: 'abc-123',
-      fromSessionId: 'anytoany:@codex:01a12d8a',
-      toSessionId: SID,
-      content: 'hello from codex',
-      createdAt: '2026-10-13T16:00:00.000Z',
-    });
-    expect(path.startsWith(join(root, SID, 'unread'))).toBe(true);
-    expect(path.endsWith('.json')).toBe(true);
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
-      version: 1,
-      messageId: 'abc-123',
-      fromSessionId: 'anytoany:@codex:01a12d8a',
-      toSessionId: SID,
-      content: 'hello from codex',
-      createdAt: '2026-10-13T16:00:00.000Z',
-    });
-    const leftovers = readdirSync(join(root, SID)).filter((f) => f !== 'unread');
-    expect(leftovers).toEqual([]);
-  });
-
-  it('refuses a session id ZCode would refuse (path escape)', () => {
-    const root = tmp('anyd-zmb-');
-    const base = { messageId: 'm', fromSessionId: 'f', content: 'c', createdAt: 'now' };
-    expect(() => postToMailbox(root, { ...base, toSessionId: '../etc' })).toThrow(/session id/);
-    expect(() => postToMailbox(root, { ...base, toSessionId: 'sess_a/../../x' })).toThrow(/session id/);
-  });
-
-  it('reclaim and drain race: exactly one of them wins', () => {
-    const root = tmp('anyd-zmb-');
-    const base = { messageId: 'm1', fromSessionId: 'f', toSessionId: SID, content: 'c', createdAt: 'now' };
-    const a = postToMailbox(root, base);
-    expect(reclaimMail(a)).toBe(true); // nobody read it — we took it back
-    expect(existsSync(a)).toBe(false);
-    const b = postToMailbox(root, { ...base, messageId: 'm2' });
-    mkdirSync(join(root, SID, 'read'), { recursive: true });
-    renameSync(b, join(root, SID, 'read', 'x.json')); // ZCode drained it first
-    expect(reclaimMail(b)).toBe(false);
+  it('a session has its mailbox on once ZCode has made its unread/ folder', () => {
+    const mailboxes = freshRoot();
+    const enabled = (id = SID) => mailboxEnabledFor(mailboxes, id);
+    expect(enabled()).toBe(false);
+    mkdirSync(join(mailboxes, SID), { recursive: true });
+    expect(enabled()).toBe(false);
+    mkdirSync(join(mailboxes, SID, 'unread'));
+    expect(enabled()).toBe(true);
+    expect(enabled('../escape')).toBe(false);
   });
 });
 
-describe('is the ZCode session running a turn right now?', () => {
-  function dbWith(rows: Array<{ role: string; created: number; completed?: number }>): string {
-    const file = join(tmp('anyd-zdb-'), 'db.sqlite');
+describe('posting a letter', () => {
+  it('lands as one complete version-1 JSON file in unread/, readable only by the owner', () => {
+    const root = freshRoot();
+    const before = Date.now();
+    const path = postToMailbox(root, letter());
+    expect(dirname(path)).toBe(join(root, SID, 'unread'));
+    const [stamp, rest] = basename(path).split(/-(.*)/s);
+    expect(Number(stamp)).toBeGreaterThanOrEqual(before);
+    expect(rest).toBe('msg-1.json');
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ version: 1, ...letter() });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(join(root, SID))).toEqual(['unread']);
+  });
+
+  it('a message id is made safe for a file name', () => {
+    const root = freshRoot();
+    const path = postToMailbox(root, letter({ messageId: 'a/b\\c d:é.v2' }));
+    expect(basename(path)).toMatch(/^\d+-a_b_c_d__\.v2\.json$/);
+  });
+
+  it('refuses session ids ZCode itself would refuse, before touching the disk', () => {
+    const root = freshRoot();
+    for (const bad of ['../etc', 'sess_a/../../x', 'sess_..', 'session_1', 'sess_', 'sess_a b']) {
+      expect(() => postToMailbox(root, letter({ toSessionId: bad }))).toThrow(`invalid ZCode session id for the mailbox: ${bad}`);
+    }
+    expect(readdirSync(root)).toEqual([]);
+  });
+});
+
+describe('taking a letter back', () => {
+  it('works while it is still unread, and leaves nothing behind', () => {
+    const root = freshRoot();
+    const path = postToMailbox(root, letter());
+    expect(reclaimMail(path)).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(readdirSync(join(root, SID, 'unread'))).toEqual([]);
+  });
+
+  it('fails once ZCode has drained it — exactly one side gets the letter', () => {
+    const root = freshRoot();
+    const path = postToMailbox(root, letter());
+    mkdirSync(join(root, SID, 'read'));
+    renameSync(path, join(root, SID, 'read', basename(path)));
+    expect(reclaimMail(path)).toBe(false);
+    expect(readdirSync(join(root, SID, 'read'))).toEqual([basename(path)]);
+  });
+});
+
+describe('is the session mid-turn? (ZCode\'s message table)', () => {
+  const NOW = 1_800_000_000_000;
+  type Msg = { session?: string; role?: string; created?: number; completed?: number; raw?: string; at?: number };
+  function messages(rows: Msg[]): string {
+    const file = join(freshRoot(), 'db.sqlite');
     const db = new Database(file);
-    db.exec('CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT, sequence INTEGER)');
-    rows.forEach((r, i) => {
-      db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?, ?)').run(
-        `msg_${i}`,
-        SID,
-        r.created,
-        r.created,
-        JSON.stringify({ role: r.role, time: { created: r.created, ...(r.completed ? { completed: r.completed } : {}) } }),
-        i,
-      );
+    db.exec('CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT)');
+    rows.forEach((m, i) => {
+      const data = m.raw ?? JSON.stringify({ role: m.role, time: { created: m.created, ...(m.completed ? { completed: m.completed } : {}) } });
+      db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run(`m${i}`, m.session ?? SID, m.at ?? m.created ?? 0, data);
     });
     db.close();
     return file;
   }
-  const NOW = 1_791_906_200_000;
+  const busy = (rows: Msg[]) => isSessionBusy(messages(rows), SID, NOW);
 
-  it('assistant message without `completed` → busy (verified live: absent during `sleep 20`)', () => {
-    expect(isSessionBusy(dbWith([{ role: 'user', created: NOW - 5000 }, { role: 'assistant', created: NOW - 4000 }]), SID, NOW)).toBe(true);
+  it('an assistant message that has not completed, younger than 30 minutes: busy', () => {
+    expect(busy([{ role: 'user', created: NOW - 60_000 }, { role: 'assistant', created: NOW - 59_000 }])).toBe(true);
+    expect(busy([{ role: 'assistant', created: NOW - 29 * 60_000 }])).toBe(true);
   });
 
-  it('finished turn → not busy', () => {
-    expect(isSessionBusy(dbWith([{ role: 'assistant', created: NOW - 9000, completed: NOW - 1000 }]), SID, NOW)).toBe(false);
+  it('a completed one, or one "running" for 30 minutes or more (a crash leftover): not busy', () => {
+    expect(busy([{ role: 'assistant', created: NOW - 5000, completed: NOW - 100 }])).toBe(false);
+    expect(busy([{ role: 'assistant', created: NOW - 30 * 60_000 }])).toBe(false);
   });
 
-  it('a turn "running" for over 30 minutes is a crash leftover → not busy', () => {
-    expect(isSessionBusy(dbWith([{ role: 'assistant', created: NOW - 31 * 60_000 }]), SID, NOW)).toBe(false);
+  it('a user message under a minute old with no answer yet: the turn is starting', () => {
+    expect(busy([{ role: 'user', created: NOW - 59_999 }])).toBe(true);
+    expect(busy([{ role: 'user', created: NOW - 60_000 }])).toBe(false);
   });
 
-  it('a user message from the last minute with no answer yet → busy (turn starting)', () => {
-    expect(isSessionBusy(dbWith([{ role: 'user', created: NOW - 10_000 }]), SID, NOW)).toBe(true);
-    expect(isSessionBusy(dbWith([{ role: 'user', created: NOW - 5 * 60_000 }]), SID, NOW)).toBe(false);
+  it('only the newest message of THIS session counts', () => {
+    expect(busy([{ role: 'assistant', created: NOW - 1000 }, { role: 'assistant', created: NOW - 900, completed: NOW - 10 }])).toBe(false);
+    expect(busy([{ role: 'assistant', created: NOW - 1000 }, { session: 'sess_other', role: 'assistant', created: NOW - 10, completed: NOW }])).toBe(true);
+    // same timestamp: the row written last wins
+    expect(busy([{ role: 'assistant', created: NOW - 1000, completed: NOW - 500, at: 5 }, { role: 'assistant', created: NOW - 1000, at: 5 }])).toBe(true);
   });
 
-  it('no db / no messages → not busy', () => {
-    expect(isSessionBusy('/nonexistent/db.sqlite', SID, NOW)).toBe(false);
-    expect(isSessionBusy(dbWith([]), SID, NOW)).toBe(false);
-  });
-});
-
-describe('ZCode delivery picks the doorbell only when the session is mid-turn with its mailbox on', () => {
-  const session: SessionInfo = { agent: 'zcode', sessionId: SID, title: 't', cwd: '/w/p', lastActiveAt: 0 };
-
-  function harness(opts: { busy: () => boolean; enabled: boolean; onPoll?: (root: string) => void }) {
-    const root = tmp('anyd-zroute-');
-    if (opts.enabled) mkdirSync(join(root, SID, 'unread'), { recursive: true });
-    const calls: string[][] = [];
-    const exec: ExecFn = async (cmd, args) => {
-      calls.push([cmd, ...args]);
-      return { stdout: 'RESUMED <<<ANYTOANY_REPLY>>> DONE', stderr: '', code: 0 };
-    };
-    const adapter = createZcodeAdapter({
-      exec,
-      engineBin: '/fake/zcode',
-      configFile: '/nonexistent/config.json',
-      mailboxRoot: root,
-      isBusy: () => opts.busy(),
-      pollMs: 1,
-      sleep: async () => opts.onPoll?.(root),
-    });
-    return { adapter, calls, root };
-  }
-
-  it('mid-turn + mailbox on: the envelope goes into the mailbox, no headless turn; replies via anyd reply', async () => {
-    const drain = (root: string) => {
-      const dir = join(root, SID, 'unread');
-      for (const f of readdirSync(dir)) {
-        mkdirSync(join(root, SID, 'read'), { recursive: true });
-        renameSync(join(dir, f), join(root, SID, 'read', f)); // what ZCode does at PostToolUse/Stop
-      }
-    };
-    const { adapter, calls, root } = harness({ busy: () => true, enabled: true, onPoll: drain });
-    expect(adapter.replyChannel?.(session)).toBe('command');
-    const r = await adapter.deliver(session, 'ENVELOPE');
-    expect(r).toEqual({ ok: true, output: '', inSession: true });
-    expect(calls).toEqual([]);
-    const [read] = readdirSync(join(root, SID, 'read'));
-    expect(JSON.parse(readFileSync(join(root, SID, 'read', read!), 'utf8')).content).toBe('ENVELOPE');
-  });
-
-  it('turn ends but the mail was never picked up → taken back and delivered the old way, exactly once', async () => {
-    let polls = 0;
-    const { adapter, calls, root } = harness({ busy: () => polls++ < 2, enabled: true });
-    const r = await adapter.deliver(session, 'ENVELOPE');
-    expect(r.ok).toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toContain('--resume');
-    expect(readdirSync(join(root, SID, 'unread'))).toEqual([]); // nothing left to be read twice
-  });
-
-  it('idle session → headless resume as before', async () => {
-    const { adapter, calls } = harness({ busy: () => false, enabled: true });
-    expect(adapter.replyChannel?.(session)).toBe('marker');
-    await adapter.deliver(session, 'ENVELOPE');
-    expect(calls[0]).toContain('--resume');
-  });
-
-  it('mid-turn but mailbox never enabled → headless resume (no file written)', async () => {
-    const { adapter, calls, root } = harness({ busy: () => true, enabled: false });
-    expect(adapter.replyChannel?.(session)).toBe('marker');
-    await adapter.deliver(session, 'ENVELOPE');
-    expect(calls[0]).toContain('--resume');
-    expect(existsSync(join(root, SID))).toBe(false);
+  it('anything it cannot read means not busy', () => {
+    expect(isSessionBusy(join(tmpdir(), 'morse-no-zcode-db.sqlite'), SID, NOW)).toBe(false);
+    expect(busy([])).toBe(false);
+    expect(busy([{ raw: 'not json', at: NOW }])).toBe(false);
+    expect(busy([{ role: 'system', created: NOW }])).toBe(false);
+    const noTable = join(freshRoot(), 'empty.sqlite');
+    new Database(noTable).close();
+    expect(isSessionBusy(noTable, SID, NOW)).toBe(false);
   });
 });
 
-describe('doctor: ZCode doorbell status', () => {
-  it('on when ZCode left unread/ dirs, off (with the how-to) otherwise, silent without ZCode', async () => {
-    const { zcodeMailboxCheck } = await import('../src/doctor.js');
-    const root = tmp('anyd-zdoc-');
-    expect(zcodeMailboxCheck(root, false)).toBeNull();
-    expect(zcodeMailboxCheck(root, true)?.note).toMatch(/^off .*launchctl setenv ZCODE_MESSAGE_ENABLED 1/);
-    mkdirSync(join(root, SID, 'unread'), { recursive: true });
-    expect(zcodeMailboxCheck(root, true)?.note).toMatch(/^on — 1 session/);
+describe('doctor reports the ZCode doorbell', () => {
+  it('nothing without ZCode; off with how to turn it on; on once a session used it', async () => {
+    const doctor = await import('../src/doctor.js');
+    const mailboxes = freshRoot();
+    expect(doctor.zcodeMailboxCheck(mailboxes, false)).toBe(null);
+    expect(doctor.zcodeMailboxCheck(join(mailboxes, 'missing'), true)?.note).toMatch(/^off .*launchctl setenv ZCODE_MESSAGE_ENABLED 1/);
+    mkdirSync(join(mailboxes, SID, 'unread'), { recursive: true });
+    const on = doctor.zcodeMailboxCheck(mailboxes, true);
+    expect(on?.note.startsWith('on — 1 session')).toBe(true);
   });
 });

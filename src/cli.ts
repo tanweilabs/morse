@@ -1,24 +1,16 @@
 #!/usr/bin/env node
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { existsSync, fstatSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { Command, Option } from 'commander';
-import { createClaudeAdapter } from './adapters/claude.js';
-import { createCodexAdapter } from './adapters/codex.js';
-import { createKimiAdapter } from './adapters/kimi.js';
-import { createRegisteredAdapter } from './adapters/registered.js';
 import type { SessionInfo } from './adapters/types.js';
-import { createZcodeAdapter } from './adapters/zcode.js';
-import { resolveTarget } from './directory/resolve.js';
-import { listAllSessions } from './directory/scanner.js';
-import { describeDirectStatus, describeRelayStatus, formatRelativeTime, shortenHome, type DirectStatusView, type RelayStatusView } from './format.js';
-import { classifyReply } from './envelope.js';
+import { cachedSessionDirectory, deliveryAdapters, sessionOrExit } from './cli/sessions.js';
+import { describeDirectStatus, describeRelayStatus, formatRelativeTime, type DirectStatusView, type RelayStatusView } from './format.js';
 import { changesContactsOrSends, OLDER_DAEMON_LINE, olderDaemonRunning } from './daemon/capabilities.js';
 import { MigrationRefusedV5, upgradeLineV5 } from './mailbox/migrate-v5.js';
 import { repairLineV5 } from './mailbox/repair-v5.js';
-import { createDb, CURRENT_SCHEMA_VERSION, mailboxVersion } from './mailbox/db.js';
+import { createDb, mailboxVersion } from './mailbox/db.js';
 import { BackupError } from './mailbox/migrate-v3.js';
 import { MigrationRefusedV4, SCHEMA_VERSION_V4 } from './mailbox/migrate-v4.js';
 import { homeContactContext } from './mailbox/home-context.js';
@@ -69,8 +61,8 @@ import { nodeStatusLine } from './node-version.js';
  * killed in between, the new parent taken for the old one, and the watch would have polled for ever.
  */
 const STARTED_BY = process.ppid;
-const require = createRequire(import.meta.url);
-const { version } = require('../package.json') as { version: string };
+/** The package's version — the same in every release (a release is told by its stamp, ADR-039). */
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
 
 /**
  * ADR-039: the daemon's auto-updater. Off for a development build (no release number:
@@ -158,24 +150,6 @@ async function startDaemonUpdater(
 /** The pinned release key + where the newest followed key is stored (ADR-039, ADR-041). */
 const releaseKeyDeps = () => ({ publicKey: RELEASE_PUBLIC_KEY, keyGeneration: RELEASE_KEY_GENERATION, keyStateFile: trustedKeyFile() });
 
-/** Adapters that can actually RECEIVE a headless delivery (the dispatcher's map). */
-/** How often the daemon checks for mail waiting on a running Claude session (ADR-027). */
-const DOORBELL_INTERVAL_MS = 2_000;
-
-const defaultAdapters = () => [
-  createClaudeAdapter(),
-  createCodexAdapter(),
-  createZcodeAdapter(),
-  createKimiAdapter(),
-];
-
-/**
- * Everything ADDRESSABLE: the delivery adapters plus registered external agents
- * (ADR-024). External sessions are listing-only — they have no `deliver`, so they
- * must never enter the dispatcher's `Map<string, DeliveryAdapter>`; they receive
- * by pulling instead (`morse message --pull`, or POST /api/inbox for desktop Apps).
- */
-const directoryAdapters = () => [...defaultAdapters(), createRegisteredAdapter()];
 /** Morse outbox policy from ~/.morse/config.json (retry an unreachable person every N s, up to M days). */
 const outboxOptions = () => {
   const o = readMachineConfig().outbox ?? {};
@@ -253,25 +227,19 @@ async function tellDaemonAccepted(handle: string, port: number | undefined, /** 
   }
 }
 
-/** Resolve an @-target into a concrete session, printing candidates on failure. */
-async function resolveOrExit(target: string): Promise<SessionRef & { title: string }> {
-  const { sessions } = await listAllSessions(directoryAdapters());
-  const r = resolveTarget(target, sessions);
-  if (r.ok) {
-    return { agent: r.session.agent, sessionId: r.session.sessionId, title: r.session.title };
-  }
-  console.error(`error: cannot resolve target "${target}" (${r.reason})`);
-  for (const c of r.candidates.slice(0, 8)) {
-    console.error(`  candidate: @${c.agent}:${c.title}  [${c.sessionId.slice(0, 8)}]`);
-  }
-  process.exit(1);
+/** `@[device/]agent`: who a message is from or for. */
+const atOf = (end: { agent: string; device?: string }): string => `@${end.device ? `${end.device}/` : ''}${end.agent}`;
+
+/** A message's text for a one-line listing: JSON-quoted, cut after 120 characters. */
+function textPreview(m: Message): string {
+  const body = m.parts.map((p) => p.text).join('\n');
+  return JSON.stringify(body.length <= 120 ? body : `${body.slice(0, 120)}…`);
 }
 
+/** One message of a listing: id, state, who to whom, the text; then a peer warning and its files. */
 function printMessage(m: Message, remarkOf?: RemarkLookup, /** (ADR-083) `  via <name>`: which of my addresses, when this computer has several */ suffix = ''): void {
-  const text = m.parts.map((p) => p.text).join('\n');
-  const bare = `${m.from.device ? `@${m.from.device}/` : '@'}${m.from.agent}`;
   // a Morse sender shows YOUR remark for its address first: <remark> (@k7f3a9xq/mini/claude) — never a nickname (ADR-065)
-  const from = m.from.device ? withRemark(bare, remarkOf) : bare;
+  const from = m.from.device ? withRemark(atOf(m.from), remarkOf) : atOf(m.from);
   const receipt = m.receiptAt ? '  ✓ receipt' : '';
   const status = m.request
     ? 'request pending (in their message requests — they have not accepted you yet)'
@@ -280,9 +248,7 @@ function printMessage(m: Message, remarkOf?: RemarkLookup, /** (ADR-083) `  via 
     : (m.status === 'failed' || m.status === 'dead') && m.lastError
       ? `${m.status} (${m.lastError})`
       : m.status;
-  console.log(
-    `[${m.id.slice(0, 8)}] ${status}${receipt}  ${from} → ${m.to.device ? `@${m.to.device}/` : '@'}${m.to.agent}:${m.to.sessionId.slice(0, 8)}  ${JSON.stringify(text.length > 120 ? `${text.slice(0, 120)}…` : text)}${suffix}`,
-  );
+  console.log(`[${m.id.slice(0, 8)}] ${status}${receipt}  ${from} → ${atOf(m.to)}:${m.to.sessionId.slice(0, 8)}  ${textPreview(m)}${suffix}`);
   if (isPeerMessage(m)) console.log(`    ⚠ ${peerTag(m, remarkOf)}`);
   // ADR-038: attachments — name, size, where the file is (inbox: saved 0600, never opened or run)
   for (const f of m.parts.flatMap((p) => p.files ?? [])) console.log(`    file: ${f.name}  ${formatBytes(f.size)}  ${f.path}`);
@@ -472,10 +438,9 @@ async function startInBackgroundAction(wait: boolean): Promise<void> {
   process.exitCode = 1;
 }
 
+// (test/local-api-followups.test.ts reads this line: STARTED_BY must be taken before it)
 const program = new Command();
-
-program
-  .name('morse')
+program.name('morse')
   .description('Morse — messaging between AI agents (Claude Code, Codex, …), across addresses and networks.')
   // the package version never changes; a release is identified by its stamp (ADR-039, ADR-075)
   .version(describeRelease(readInstalledRelease()))
@@ -506,21 +471,41 @@ const removedCommand = (name: string, what: string) =>
 removedCommand('collab', 'the shared collaboration doc is gone; agents coordinate in their messages');
 removedCommand('flush', 'the daemon delivers (morse start)');
 
-program
-  .command('start', hidden)
-  .description('Start the morse daemon (foreground) — delivers messages + serves the web console')
-  .option('--interval <ms>', 'mailbox poll interval', '1000')
-  .option('--directory-ttl <ms>', 'session directory cache TTL', '30000')
-  .option('--port <port>', 'web console port', '7433')
-  .option('--no-web', 'disable the web console server')
-  .option('--lan', 'hand messages over on the LAN by address (mDNS) this run — off unless morse.lan is true in config.json')
-  .option('--no-lan', 'do not hand messages over on the LAN, even with morse.lan: true')
-  .option('--no-notify', 'disable macOS notifications on new cross-agent traffic')
-  .option('--peer <address@host:port...>', 'an address served on the LAN at host:port, without mDNS (networks where multicast does not work)')
-  .option('--peer-port <port>', 'LAN port other Morse daemons hand messages to (default: console port + 1)')
-  .option('--relay <url>', 'Morse relay (ws:// or wss://) (default: relay.url in ~/.morse/config.json)')
-  .option('--background', 'start the daemon in the background (output appended to daemon.log in the data directory) and return — what the Windows logon task runs; on macOS / Linux launchd / systemd do this')
-  .option('--no-wait', 'with --background: return at once, without checking that the daemon came up')
+/** `morse start`'s options, in the order its help lists them: flags, what they do, the default when given. */
+const START_OPTIONS: ReadonlyArray<readonly [flags: string, description: string, byDefault?: string]> = [
+  ['--interval <ms>', 'mailbox poll interval', '1000'],
+  ['--directory-ttl <ms>', 'session directory cache TTL', '30000'],
+  ['--port <port>', 'web console port', '7433'],
+  ['--no-web', 'disable the web console server'],
+  ['--lan', 'hand messages over on the LAN by address (mDNS) this run — off unless morse.lan is true in config.json'],
+  ['--no-lan', 'do not hand messages over on the LAN, even with morse.lan: true'],
+  ['--no-notify', 'disable macOS notifications on new cross-agent traffic'],
+  ['--peer <address@host:port...>', 'an address served on the LAN at host:port, without mDNS (networks where multicast does not work)'],
+  ['--peer-port <port>', 'LAN port other Morse daemons hand messages to (default: console port + 1)'],
+  ['--relay <url>', 'Morse relay (ws:// or wss://) (default: relay.url in ~/.morse/config.json)'],
+  ['--background', 'start the daemon in the background (output appended to daemon.log in the data directory) and return — what the Windows logon task runs; on macOS / Linux launchd / systemd do this'],
+  ['--no-wait', 'with --background: return at once, without checking that the daemon came up'],
+];
+const startCmd = program.command('start', hidden).description('Start the morse daemon (foreground) — delivers messages + serves the web console');
+for (const [flags, description, byDefault] of START_OPTIONS) {
+  if (byDefault === undefined) startCmd.option(flags, description);
+  else startCmd.option(flags, description, byDefault);
+}
+
+/** Does anything answer on this port of 127.0.0.1? (ADR-087: /api/ping is the one route that needs no token.) */
+const portAnswers = (port: number): Promise<boolean> =>
+  fetch(`http://127.0.0.1:${port}/api/ping`, { signal: AbortSignal.timeout(1500) }).then(
+    () => true,
+    () => false,
+  );
+
+/** `morse start` cannot go on: one line on stderr, exit code 1. */
+const cannotStart = (line: string): never => {
+  console.error(line);
+  process.exit(1);
+};
+
+startCmd
   .action(async (opts: { interval: string; directoryTtl: string; port: string; peerPort?: string; web: boolean; lan?: boolean; notify: boolean; peer?: string[]; relay?: string; background?: boolean; wait: boolean }) => {
     // (ADR-089 follow-up M1) where launchd / systemd runs the daemon, a start by hand goes to it
     if (!isWindows() && (await handStartToServiceManager())) return;
@@ -556,68 +541,32 @@ program
       opts.lan = false;
       console.log(`windows: ${offLine('lan')}`);
     }
-    const adapters = defaultAdapters();
     const mailbox = openMailbox();
-    const port = Number.parseInt(opts.port, 10) || 7433;
-
-    let cache: { at: number; sessions: Awaited<ReturnType<typeof listAllSessions>>['sessions'] } | null = null;
-    const ttl = Number.parseInt(opts.directoryTtl, 10) || 30_000;
-    const invalidateDirectory = () => {
-      cache = null;
-    };
-    const localDirectory = async () => {
-      if (!cache || Date.now() - cache.at > ttl) {
-        // directoryAdapters(), not `adapters`: registered external agents must be
-        // addressable (so replies to them resolve) but must NOT be deliverable.
-        const { sessions, errors } = await listAllSessions(directoryAdapters());
-        for (const e of errors) console.error(`warning: ${e.agent} scan failed: ${e.error.message}`);
-        cache = { at: Date.now(), sessions };
-      }
-      return cache.sessions;
-    };
-
-    // (ADR-091) the sessions of this computer only: other computers are contacts, and nobody reads anyone's sessions
-    const directory = async () => {
-      const all = await localDirectory();
-      // Phase 2.5: keep the @any- mention agents in step with the live directory —
-      // but never from an isolated instance (MORSE_HOME / ANYTOANY_HOME set: tests, smoke runs):
-      // it would rewrite, and prune, the operator's real ~/.claude/agents/any-*.
-      if (isIsolatedHome()) return all;
-      try {
-        const { syncMentionAgents } = await import('./cluster/sync-agents.js');
-        const { written, removed } = await syncMentionAgents(all, mailbox.listConversations());
-        if (written.length || removed.length) {
-          console.log(`mention agents: +${written.length} -${removed.length} (~/.claude/agents/any-*)`);
-        }
-      } catch (e) {
-        console.error(`warning: mention agent sync failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      return all;
-    };
+    /** A whole-number option, or its fallback when it is missing, 0 or not a number. */
+    const numberOr = (text: string | undefined, fallback: number): number => Number.parseInt(text ?? '', 10) || fallback;
+    const port = numberOr(opts.port, 7433);
+    /**
+     * The @any- mention agents (~/.claude/agents/any-*) follow the session directory — never from an isolated
+     * home (MORSE_HOME / ANYTOANY_HOME set: tests, smoke runs), which would rewrite and prune the operator's real ones.
+     */
+    const syncMentions = (sessions: SessionInfo[]): Promise<void> =>
+      import('./cluster/sync-agents.js')
+        .then(({ syncMentionAgents }) => syncMentionAgents(sessions, mailbox.listConversations()))
+        .then(({ written, removed }) => {
+          if (written.length + removed.length > 0) console.log(`mention agents: +${written.length} -${removed.length} (~/.claude/agents/any-*)`);
+        })
+        .catch((e: unknown) => console.error(`warning: mention agent sync failed: ${e instanceof Error ? e.message : String(e)}`));
+    // (ADR-091) the sessions of this computer only: other computers are contacts, and nobody reads anyone's sessions.
+    // Registered external agents are in it (replies to them must resolve) but are never delivered to.
+    const sessionDirectory = cachedSessionDirectory(numberOr(opts.directoryTtl, 30_000), isIsolatedHome() ? undefined : syncMentions);
 
     const { writePid, clearPid, runningDaemonPid } = await import('./daemon/pidfile.js');
     // (ADR-083 review N3) a left-over pid file whose pid is another program's by now is stale: removed, and this daemon starts
     const existing = runningDaemonPid();
-    if (existing && existing !== process.pid) {
-      console.error(`daemon already running (pid ${existing}) — stop it first with morse stop`);
-      process.exit(1);
-    }
-    // A live console on our port means another morse owns this machine even if
-    // its pid file is gone — bail BEFORE touching the pid file, or our exit
-    // cleanup would erase the survivor's record.
-    if (opts.web || opts.lan) {
-      // (ADR-087: the liveness probe — the one route that needs no token; any answer at all means the port is taken)
-      const occupied = await fetch(`http://127.0.0.1:${port}/api/ping`, {
-        signal: AbortSignal.timeout(1500),
-      }).then(
-        () => true,
-        () => false,
-      );
-      if (occupied) {
-        console.error(`port ${port} is already serving — another morse is running (morse stop first)`);
-        process.exit(1);
-      }
-    }
+    if (existing && existing !== process.pid) cannotStart(`daemon already running (pid ${existing}) — stop it first with morse stop`);
+    // Something answering on our port is another morse that owns this computer, pid file or not. Checked BEFORE the
+    // pid file is touched: this process's exit cleanup would otherwise erase the survivor's record.
+    if ((opts.web || opts.lan) && (await portAnswers(port))) cannotStart(`port ${port} is already serving — another morse is running (morse stop first)`);
     // ADR-080 — Windows: the daemon holds daemon.lock for as long as it lives; that, not the pid, tells a running
     // daemon from a stale pid file there (pids are reused fast, a logoff kills without cleanup). A no-op elsewhere
     {
@@ -644,15 +593,15 @@ program
 
     const { ownAddressByName } = await import('./daemon/own-address.js');
 
-    const stale = mailbox.recoverStale();
-    if (stale > 0) console.log(`recovered ${stale} message(s) stranded by a previous daemon run`);
-
-    const { createNotifier } = await import('./daemon/notify.js');
-    const notifier = createNotifier({ enabled: opts.notify });
+    const recovered = mailbox.recoverStale();
+    if (recovered > 0) console.log(`recovered ${recovered} message(s) stranded by a previous daemon run`);
+    // macOS notifications of new cross-agent traffic (off with --no-notify)
+    const notifier = (await import('./daemon/notify.js')).createNotifier({ enabled: opts.notify });
 
     console.log(`morse ${version} — daemon starting (poll ${opts.interval}ms)`);
 
-    let web: { notifyChange(): void; close(): void; port: number } | null = null;
+    /** The local API and web console, once it is up (not with --no-web, unless the LAN is on). */
+    let web: ReturnType<typeof import('./daemon/server.js').startConsoleServer> | undefined;
     // (declared before the LAN starts: the LAN asks which addresses to announce as soon as it is up)
     let morse: import('./cluster/morse.js').Morse | null = null;
     // (ADR-091) the LAN by address: the same sealed envelopes the relay carries, handed over directly to an address
@@ -662,10 +611,10 @@ program
     let lanSeq = 0;
     if (opts.lan) {
       const { startAddressLan } = await import('./cluster/lan-address.js');
-      const peerPort = Number.parseInt(opts.peerPort ?? '', 10) || port + 1;
       try {
         lanAddress = await startAddressLan({
-          port: peerPort,
+          // (default: the port after the console's)
+          port: numberOr(opts.peerPort, port + 1),
           // (only the first address is announced and proven; envelopes are opened before they are taken)
           address: () => morse?.status().v3?.address ?? null,
           sign: (address, message) => morse?.lanSign?.(address, message) ?? null,
@@ -735,30 +684,29 @@ program
       return { ok: false, error: `${device} unreachable: no relay configured (morse address sets one up)` };
     };
 
-    const initial = await directory();
-    console.log(`directory: ${initial.length} sessions discovered`);
+    console.log(`directory: ${(await sessionDirectory.list()).length} sessions discovered`);
 
-    const { isMonitored } = await import('./daemon/monitor.js');
-    const { isSessionLive } = await import('./daemon/session-liveness.js');
     const { isRegisteredSession, listRegistered } = await import('./registry/external.js');
-    const adapterByAgent = new Map(adapters.map((a) => [a.agent, a]));
-    // ADR-025: refuse a send at once when headless delivery would run an older CLI
-    // than the App that wrote the target session. Targets that pull their own mail
-    // (live / monitored / external) never go through the CLI, so they're exempt.
-    const preflight = async (s: SessionInfo): Promise<string | null> => {
-      // ADR-080: on Windows nothing is delivered through an agent CLI in this release — every session pulls its mail
-      if (platformOff('plugins')) return null;
-      if (isMonitored(s.sessionId) || isSessionLive(s.sessionId) || isRegisteredSession(s.sessionId)) return null;
-      return (await adapterByAgent.get(s.agent)?.preflight?.(s)) ?? null;
-    };
+    /**
+     * ADR-025: a send is refused at once when its headless delivery would run a CLI older than the App that wrote
+     * the target session — null: nothing against it. A session that takes its mail itself (watched by
+     * `morse read --wait`, live in its App, an external agent) is never delivered through a CLI: nothing to check.
+     */
+    const preflight = await (async () => {
+      const [{ isMonitored }, { isSessionLive }] = await Promise.all([import('./daemon/monitor.js'), import('./daemon/session-liveness.js')]);
+      const deliverers = new Map(deliveryAdapters().map((adapter) => [adapter.agent, adapter]));
+      const pullsItself = (id: string): boolean => isMonitored(id) || isSessionLive(id) || isRegisteredSession(id);
+      return async (s: SessionInfo): Promise<string | null> => {
+        // ADR-080: on Windows nothing is delivered through an agent CLI in this release — every session pulls its mail
+        if (platformOff('plugins') || pullsItself(s.sessionId)) return null;
+        return (await deliverers.get(s.agent)?.preflight?.(s)) ?? null;
+      };
+    })();
     if (opts.web || opts.lan) {
-      const { startConsoleServer } = await import('./daemon/server.js');
-      web = startConsoleServer({
-        mailbox,
-        directory,
-        port,
-        invalidateDirectory,
-        preflight,
+      web = (await import('./daemon/server.js')).startConsoleServer({
+        port, mailbox, preflight,
+        directory: sessionDirectory.list,
+        invalidateDirectory: sessionDirectory.invalidate,
         token: daemonToken,
         shutdown: { run: () => requestStop() },
         updateStatus: () => {
@@ -813,8 +761,6 @@ program
       console.log(`local API on 127.0.0.1:${web.port} (this home's morse command only) — web console: morse console`);
     }
 
-    const { startDispatcher } = await import('./daemon/dispatcher.js');
-    const { VERSION_MISMATCH } = await import('./adapters/version-guard.js');
     const { createRepeatFilter, rotateLogIfLarge } = await import('./daemon/log-hygiene.js');
     const repeats = createRepeatFilter();
     // ADR-046: daemon.log (launchd's StandardOutPath, or `>>` by hand) is rotated at 5 MB, 3 kept
@@ -824,48 +770,36 @@ program
     };
     rotate();
     setInterval(rotate, 60_000).unref();
+    const { VERSION_MISMATCH } = await import('./adapters/version-guard.js');
+    /**
+     * Each delivery event: a log line (ADR-046: the same 'waiting' / 'failed' for the same target only at growing
+     * intervals), the console told; the operator is notified of a CLI too old to deliver with, and of mail that
+     * reached one of the sessions here.
+     */
+    const onDispatch = (event: import('./daemon/dispatcher.js').DispatchEvent): void => {
+      const { kind, detail, message: m } = event;
+      const to = `@${m.to.device ?? 'local'}/${m.to.agent}`;
+      const target = `${to}:${m.to.sessionId}`;
+      const line = `[${new Date().toISOString()}] ${kind} ${m.id.slice(0, 8)} @${m.from.agent} → ${to}${detail ? ` — ${detail}` : ''}`;
+      if (kind === 'delivered') repeats.forget(`${target}\0`);
+      const shown = kind === 'waiting' || kind === 'failed' ? repeats.pass(`${target}\0${kind}\0${detail ?? ''}`, line) : line;
+      if (shown) console.log(shown);
+      web?.notifyChange();
+      if (kind === 'failed' && detail?.startsWith(VERSION_MISMATCH)) notifier.versionMismatch(m.to.agent, detail);
+      else if (kind === 'delivered' && !m.to.device) notifier.sessionActivity(m.to.agent, sessionDirectory.titleOf(m.to.sessionId) ?? m.to.sessionId.slice(0, 8), m.to.sessionId, 'received');
+    };
     // ADR-052: the core delivers OUTBOUND only (other devices, people, the human's inbox);
     // it never runs an agent. Own-agent mail for a session here is the dispatch plugin's.
-    const running = startDispatcher(
-      {
-        mailbox,
-        pullOnlySessions: ['inbox'],
-        ...(selfDevice ? { selfDevice, relay: transport } : {}),
-        onEvent: (e) => {
-          const m = e.message;
-          const target = `@${m.to.device ?? 'local'}/${m.to.agent}:${m.to.sessionId}`;
-          const line = `[${new Date().toISOString()}] ${e.kind} ${m.id.slice(0, 8)} @${m.from.agent} → @${m.to.device ?? 'local'}/${m.to.agent}${e.detail ? ` — ${e.detail}` : ''}`;
-          // ADR-046: the same 'waiting' / 'failed' for the same target is logged at growing intervals
-          if (e.kind === 'delivered') repeats.forget(`${target}\0`);
-          const shown = e.kind === 'waiting' || e.kind === 'failed' ? repeats.pass(`${target}\0${e.kind}\0${e.detail ?? ''}`, line) : line;
-          if (shown) console.log(shown);
-          web?.notifyChange();
-          if (e.kind === 'failed' && e.detail?.startsWith(VERSION_MISMATCH)) {
-            notifier.versionMismatch(m.to.agent, e.detail);
-          }
-          if (e.kind === 'delivered' && !m.to.device) {
-            const title = cache?.sessions.find((s) => s.sessionId === m.to.sessionId)?.title ?? m.to.sessionId.slice(0, 8);
-            notifier.sessionActivity(m.to.agent, title, m.to.sessionId, 'received');
-          }
-        },
-      },
-      { intervalMs: Number.parseInt(opts.interval, 10) || 1000 },
-    );
+    const delivery = { mailbox, pullOnlySessions: ['inbox'], ...(selfDevice ? { selfDevice, relay: transport } : {}), onEvent: onDispatch };
+    const running = (await import('./daemon/dispatcher.js')).startDispatcher(delivery, { intervalMs: numberOr(opts.interval, 1000) });
 
-    // External agents are pull-only, so their mail never emits a 'delivered'
-    // event and the notifier above never fires for them. A desktop App like 闪电说
-    // also has no self-drive — nothing wakes it until the user speaks. So this
-    // is the only signal the operator gets that a reply arrived (ADR-024).
-    const { startExternalInboxNotifier } = await import('./daemon/external-notify.js');
-    const externalNotifier = startExternalInboxNotifier({
-      mailbox,
-      // the dispatch plugin's own profile addresses (@dispatch:<profile>) are not pull-only: it runs them (ADR-056)
+    // ADR-024: an external agent pulls its mail — no 'delivered' event, so nothing above fires for it — and a desktop
+    // App such as 闪电说 does nothing until its user speaks. A notification is the operator's only sign that a reply
+    // waits there. (The dispatch plugin's own profile addresses, @dispatch:<profile>, are not pull-only: it runs them, ADR-056.)
+    const externalNotifier = (await import('./daemon/external-notify.js')).startExternalInboxNotifier({
+      mailbox, notifier,
       listRegistered: () => listRegistered().filter((s) => s.agent !== 'dispatch'),
-      notifier,
-      onNotify: (session, messageId) =>
-        console.log(
-          `[${new Date().toISOString()}] external-inbox ${messageId.slice(0, 8)} waiting for @${session.agent}:${session.title} — notified`,
-        ),
+      onNotify: (session, messageId) => console.log(`[${new Date().toISOString()}] external-inbox ${messageId.slice(0, 8)} waiting for @${session.agent}:${session.title} — notified`),
     });
 
     // ADR-051: the on_message plugin hook — beside delivery, never in its path
@@ -919,16 +853,24 @@ program
       log: (l) => console.log(`[${new Date().toISOString()}] ${l}`),
     });
     const shutdown = () => stopper.request();
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, shutdown);
     // ADR-080: the same orderly stop without a signal (POST /api/shutdown — Windows has no SIGTERM)
     requestStop = shutdown;
-    await new Promise(() => {
-      /* run until signalled */
-    });
+    // from here on the daemon only reacts — until the orderly stop ends the process
+    await new Promise<never>(() => undefined);
   });
-program
-  .command('stop', hidden)
+
+/** Ask a process to stop the polite way (the daemon's SIGTERM runs the orderly stop); false: there is no such process. */
+const askToStop = (pid: number): boolean => {
+  try {
+    process.kill(pid, 'SIGTERM');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+program.command('stop', hidden)
   .description('Stop the morse daemon')
   .option('--restart', 'restart it instead: a message being handled may finish first, then launchd / systemd starts it again (a daemon started by hand is only stopped)')
   .action(async (opts: { restart?: boolean }) => {
@@ -943,7 +885,7 @@ program
         return;
       }
     }
-    let pid = readPid();
+    let pid: number | null = readPid();
     if (pid && isAlive(pid) && isMorseDaemon(pid) === 'no') {
       // (ADR-083 review N3) the pid file is a left-over: its pid is another program's by now — not ours to signal
       clearPid(pid);
@@ -978,19 +920,11 @@ program
       // cannot be said for sure, nothing is touched.
       const { readDaemonInfo } = await import('./daemon/capabilities.js');
       const info = readDaemonInfo();
-      if (!info || !isAlive(info.pid) || isMorseDaemon(info.pid) !== 'yes') {
-        console.log('daemon not running (no pid file)');
-        return;
-      }
+      if (!info || !isAlive(info.pid) || isMorseDaemon(info.pid) !== 'yes') return console.log('daemon not running (no pid file)');
       pid = info.pid;
       console.log(`pid file missing — this home's daemon.json names the daemon (pid ${pid})`);
     }
-    try {
-      process.kill(pid, 'SIGTERM');
-      console.log(`sent SIGTERM to daemon (pid ${pid})`);
-    } catch {
-      console.log(`daemon pid ${pid} not alive — cleaning pid file`);
-    }
+    console.log(askToStop(pid) ? `sent SIGTERM to daemon (pid ${pid})` : `daemon pid ${pid} not alive — cleaning pid file`);
     clearPid();
     if (opts.restart) byHand();
   });
@@ -1016,8 +950,7 @@ program
       process.exit(1);
     }
   });
-program
-  .command('status', hidden)
+program.command('status', hidden)
   .description('Daemon, relay, mailbox and update state; --check also checks the environment is ready for Morse (was morse doctor)')
   .option('--port <port>', "daemon console port (this home's daemon's — any other port is refused; kept for older scripts)")
   .option('--check', 'also check the environment: agent CLIs, session folders, hooks (exit code 1 if something is missing)')
@@ -1025,7 +958,7 @@ program
     const { runningDaemonPid } = await import('./daemon/pidfile.js');
     const pid = runningDaemonPid();
     const running = pid !== null;
-    console.log(`daemon: ${running ? `running (pid ${pid})` : 'not running'}`);
+    console.log(running ? `daemon: running (pid ${pid})` : 'daemon: not running');
     try {
       // ADR-077: where the identity v3 contact migration stands on this computer
       const contacts = openMailbox().contacts;
@@ -1054,14 +987,12 @@ program
       // ADR-069: direct links to contacts (WebRTC), relay as fallback
       if (peers?.relay) console.log(describeDirectStatus(peers.relay.direct));
     }
-    const counts = openMailbox()
-      .inbox({ all: true })
-      .reduce<Record<string, number>>((acc, m) => {
-        acc[m.status] = (acc[m.status] ?? 0) + 1;
-        return acc;
-      }, {});
-    const total = Object.values(counts).reduce((a, b) => a + b, 0);
-    console.log(`mailbox: ${total} messages${total ? ` — ${Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(', ')}` : ''}`);
+    // every message by state, in the order the states first occur
+    const all = openMailbox().inbox({ all: true });
+    const perState = new Map<string, number>();
+    for (const { status } of all) perState.set(status, (perState.get(status) ?? 0) + 1);
+    const breakdown = Array.from(perState, ([status, n]) => `${status}: ${n}`).join(', ');
+    console.log(all.length ? `mailbox: ${all.length} messages — ${breakdown}` : 'mailbox: 0 messages');
     // ADR-039
     const r = readInstalledRelease();
     console.log(`release: ${describeRelease(r)}${r.builtAt ? `, built ${r.builtAt}` : ''}`);
@@ -1174,45 +1105,9 @@ program
       console.log('daemon: running by hand — restart it to apply: morse stop --restart');
     }
   });
-program
-  .command('hook', hidden)
-  .description('Hook processors wired into agent CLIs (internal)')
-  .argument('<kind>', 'hook kind: claude-prompt-submit | codex-prompt-submit')
-  .action(async (kind: string) => {
-    if (kind !== 'claude-prompt-submit' && kind !== 'codex-prompt-submit') {
-      console.error(`unknown hook kind: ${kind}`);
-      process.exitCode = 1;
-      return;
-    }
-    const chunks: Buffer[] = [];
-    for await (const c of process.stdin) chunks.push(c as Buffer);
-    let input: { session_id?: string; thread_id?: string } = {};
-    try {
-      input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { session_id?: string; thread_id?: string };
-    } catch {
-      /* tolerate malformed hook payloads — emit no context */
-    }
-    if (isWindows()) {
-      // ADR-080: a hook that never runs fails silently — leave a trace `morse status --check` can show
-      const { recordHookRun } = await import('./platform/win-hooks.js');
-      recordHookRun(kind, dataDir());
-    }
-    // (ADR-080, ADR-083) The hook has to be quick — Codex gives it 10 s, and the user's prompt waits for it. It is
-    // never the process that creates the mailbox, nor the one that performs — or waits behind — a schema
-    // migration (a backup, a transaction, up to 30 s on the lock): that is the daemon's, or the next ordinary
-    // command's. No mailbox yet, or one of an older schema: no context this time, silently.
-    const schema = mailboxVersion();
-    if (schema === null || schema < CURRENT_SCHEMA_VERSION) {
-      console.log('{}');
-      return;
-    }
-    const { processPromptHook } = await import('./hooks/prompt-hook.js');
-    // (ADR-088 §4) MORSE_ADDRESS in the session's environment: the one line about other people's mail counts what was
-    // written to that address. Unset — or naming no address here (a hook never fails a prompt over it): everything.
-    const env = (await import('./commands/known-as.js')).addressFromEnv();
-    const mine = env && !('error' in env) ? env : null;
-    console.log(JSON.stringify(processPromptHook(openMailbox(), input, mine ? { mineOnly: mine.address } : {})));
-  });
+// `morse hook <kind>`: the UserPromptSubmit hooks `morse setup` registers with Claude Code and Codex
+const hookCmd = program.command('hook', hidden).description('Hook processors wired into agent CLIs (internal)');
+hookCmd.argument('<kind>', 'hook kind: claude-prompt-submit | codex-prompt-submit').action(async (kind: string) => (await import('./cli/hook-command.js')).runHookCommand(kind, openMailbox));
 /**
  * `morse address` (ADR-074; was `morse relay show`; output ADR-077 J): the address(es) this
  * computer hosts with their local names, the old name that still reaches you, and the relay.
@@ -1564,73 +1459,35 @@ autostartCmd
   });
 
 // ADR-074: hidden alias of `morse status --check` (the checks only)
-program
-  .command('doctor', hidden)
-  .description('(alias) morse status --check')
-  .action(runChecks);
-program
-  .command('setup', hidden)
-  .description('Install the morse skill into agent CLIs and register the Claude hook')
-  .option('--no-hook', 'skip Claude settings.json hook registration')
-  .action(async (opts: { hook: boolean }) => {
-    // ADR-035: move ~/.anytoany → ~/.morse (stops a running daemon for the move)
-    const { migrateDataDir } = await import('./migrate-home.js');
-    const { dataDir } = await import('./home.js');
-    const { mkdirSync } = await import('node:fs');
-    const moved = await migrateDataDir({ stopDaemon: true, log: (l) => console.log(l) });
-    mkdirSync(dataDir(), { recursive: true });
-    try {
-      // ADR-080 — Windows: private to its owner before anything is written into it (a no-op elsewhere)
-      (await import('./platform/acl.js')).protectDataDir(dataDir());
-    } catch (e) {
-      console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
-      process.exit(1);
-    }
-    console.log(`data directory: ${dataDir()}${moved.status === 'skipped' ? ` (not moved: ${moved.reason})` : ''}`);
-    if (moved.stoppedDaemon) console.log('the daemon was stopped for the move — start it again: morse start (launchd / systemd restart it by themselves)');
-    const { runSetup } = await import('./setup.js');
-    await runSetup({ withHook: opts.hook });
-  });
-program
-  .command('list', hidden)
-  .description('List addressable sessions found here; --conversations: the session-to-session conversations (was morse conversations)')
-  .option('--json', 'output as JSON')
-  .option('--limit <n>', 'max sessions to show (0 = all)', '20')
+program.command('doctor', hidden).description('(alias) morse status --check').action(runChecks);
+
+const setupCmd = program.command('setup', hidden).description('Install the morse skill into agent CLIs and register the Claude hook');
+setupCmd.option('--no-hook', 'skip Claude settings.json hook registration').action(async ({ hook }: { hook: boolean }) => {
+  // ADR-035: move ~/.anytoany → ~/.morse (stops a running daemon for the move)
+  const { migrateDataDir } = await import('./migrate-home.js');
+  const { dataDir } = await import('./home.js');
+  const { mkdirSync } = await import('node:fs');
+  const moved = await migrateDataDir({ stopDaemon: true, log: (l) => console.log(l) });
+  mkdirSync(dataDir(), { recursive: true });
+  try {
+    // ADR-080 — Windows: private to its owner before anything is written into it (a no-op elsewhere)
+    (await import('./platform/acl.js')).protectDataDir(dataDir());
+  } catch (e) {
+    console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  console.log(`data directory: ${dataDir()}${moved.status === 'skipped' ? ` (not moved: ${moved.reason})` : ''}`);
+  if (moved.stoppedDaemon) console.log('the daemon was stopped for the move — start it again: morse start (launchd / systemd restart it by themselves)');
+  await (await import('./setup.js')).runSetup({ withHook: hook });
+});
+
+const listCmd = program.command('list', hidden).description('List addressable sessions found here; --conversations: the session-to-session conversations (was morse conversations)');
+listCmd.option('--json', 'output as JSON').option('--limit <n>', 'max sessions to show (0 = all)', '20');
+listCmd
   .option('--conversations', 'the established session-to-session conversations instead')
   .action(async (opts: { json?: boolean; limit: string; conversations?: boolean }) => {
     if (opts.conversations) return showConversations(opts);
-    const { sessions, errors } = await listAllSessions(directoryAdapters());
-    const limit = Number.parseInt(opts.limit, 10) || 0;
-    const shown = limit > 0 ? sessions.slice(0, limit) : sessions;
-
-    if (opts.json) {
-      console.log(
-        JSON.stringify(
-          { sessions: shown, total: sessions.length, errors: errors.map((e) => ({ agent: e.agent, message: e.error.message })) },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    const { isRegisteredSession } = await import('./registry/external.js');
-    for (const s of shown) {
-      const id = s.sessionId.slice(0, 8);
-      const prefix = s.device ? `@${s.device}/` : '@';
-      // External agents receive by pulling, never by headless resume (ADR-024).
-      const notes = [
-        formatRelativeTime(s.lastActiveAt),
-        ...(s.cwd ? [shortenHome(s.cwd)] : []),
-        ...(!s.device && isRegisteredSession(s.sessionId) ? ['external, pull-only'] : []),
-      ];
-      console.log(`${prefix}${s.agent}:${s.title}  [${id}]  (${notes.join(', ')})`);
-    }
-    if (sessions.length > shown.length) {
-      console.log(`… ${sessions.length - shown.length} more (use --limit 0 for all)`);
-    }
-    for (const e of errors) {
-      console.error(`warning: ${e.agent} scan failed: ${e.error.message}`);
-    }
+    await (await import('./cli/listing.js')).listSessions(opts);
   });
 interface ExternalOpts {
   agent: string;
@@ -1640,34 +1497,30 @@ interface ExternalOpts {
 }
 /** Register an external agent session (ADR-024): `morse connect --agent … --session …` (was `morse register`). */
 async function registerExternal(opts: ExternalOpts): Promise<void> {
-  const { register } = await import('./registry/external.js');
-  try {
-    const s = register({
-      agent: opts.agent,
-      sessionId: opts.session,
-      ...(opts.title ? { title: opts.title } : {}),
-      ...(opts.cwd ? { cwd: opts.cwd } : {}),
-    });
-    console.log(`registered @${s.agent}:${s.title}  [${s.sessionId}]`);
+  const registry = await import('./registry/external.js');
+  const session = { agent: opts.agent, sessionId: opts.session, ...(opts.title ? { title: opts.title } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}) };
+  // (a name that is not allowed, or a registry that cannot be written: one line, exit code 1)
+  await (async () => {
+    const s = registry.register(session);
+    console.log(`registered ${sessionLabel(s)}  [${s.sessionId}]`);
     console.log('it is pull-only — it receives via `morse read --pull` or POST /api/inbox, never a headless resume');
     // (ADR-087) an app that calls the local API itself presents its own token — and acts as this agent only
     // — for THIS session id only (follow-up 1): register, read mail and send as (@agent, this session), nothing else
     const { ensureExternalToken, externalHeaderPath } = await import('./daemon/local-api.js');
     ensureExternalToken(s.agent, undefined, { session: s.sessionId });
     console.log(`its token for the local API — as @${s.agent}, session ${s.sessionId} only (POST /api/register, /api/inbox, /api/send; GET /api/sessions): curl -H @${externalHeaderPath(s.agent)} …`);
-  } catch (e) {
+  })().catch((e: unknown) => {
     console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
     process.exitCode = 1;
-  }
+  });
 }
 /** `morse connect --agent … --session … --uninstall` (was `morse unregister`). */
-async function unregisterExternal(opts: { agent: string; session: string }): Promise<void> {
-  const { unregister } = await import('./registry/external.js');
-  unregister(opts.agent, opts.session);
-  console.log(`unregistered @${opts.agent}:${opts.session}`);
+async function unregisterExternal({ agent, session }: { agent: string; session: string }): Promise<void> {
+  (await import('./registry/external.js')).unregister(agent, session);
+  console.log(`unregistered @${agent}:${session}`);
   // (ADR-087) the token is no longer for this session; with its last session gone, so is the token
   const { unbindExternalSession, removeExternalToken } = await import('./daemon/local-api.js');
-  if (unbindExternalSession(opts.agent, opts.session)) removeExternalToken(opts.agent);
+  if (unbindExternalSession(agent, session)) removeExternalToken(agent);
 }
 program
   .command('register', hidden)
@@ -1677,8 +1530,7 @@ program
   .option('--title <title>', 'human-readable name used for @-target matching')
   .option('--cwd <dir>', 'project directory, if the app has one')
   .action(registerExternal);
-program
-  .command('unregister', hidden)
+program.command('unregister', hidden)
   .description('(alias) morse connect --agent <name> --session <id> --uninstall')
   .requiredOption('--agent <name>', 'agent name')
   .requiredOption('--session <id>', 'session id')
@@ -1693,67 +1545,43 @@ program
   .option('--session <id>', 'an external agent session: the session id the app reports for itself')
   .option('--title <title>', 'with --agent: human-readable name used for @-target matching')
   .option('--cwd <dir>', 'with --agent: project directory, if the app has one')
-  .option('--app-home <dir>', 'override the app data directory')
+  .addOption(new Option('--app-home <dir>', 'override the app data directory'))
   .option('--port <port>', "daemon port the app should call (default: this home's daemon's, else 7433)")
-  .action((app: string | undefined, opts: { apply?: boolean; uninstall?: boolean; appHome?: string; port?: string; agent?: string; session?: string; title?: string; cwd?: string }) => {
-    void (async () => {
-      if (app === undefined) {
-        if (!opts.agent || !opts.session) {
-          console.error('error: connect an app (morse connect sds), or an external agent session: morse connect --agent <name> --session <id> [--title <title>] [--cwd <dir>]');
-          process.exitCode = 1;
-          return;
-        }
-        const ext = { agent: opts.agent, session: opts.session };
-        if (opts.uninstall) return unregisterExternal(ext);
-        return registerExternal({ ...ext, ...(opts.title ? { title: opts.title } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}) });
-      }
-      if (app !== 'sds') {
-        console.error(`error: unknown app "${app}" — supported: sds (闪电说)`);
-        process.exitCode = 1;
-        return;
-      }
-      const { resolveSdsPaths, planSdsInstall, planSdsUninstall, applyChanges, SDS_AGENT } = await import(
-        './integrations/sds.js'
-      );
-      const { ensureExternalToken, removeExternalToken, explicitPort, daemonOfThisHome } = await import('./daemon/local-api.js');
-      const paths = resolveSdsPaths(opts.appHome ? { appHome: opts.appHome } : {});
-      const port = explicitPort(opts.port) ?? daemonOfThisHome()?.port ?? 7433;
-
-      let changes;
-      try {
-        changes = opts.uninstall ? planSdsUninstall(paths) : planSdsInstall(paths, { port });
-      } catch (e) {
-        console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
-        process.exitCode = 1;
-        return;
-      }
-
-      console.log(`闪电说 data dir: ${shortenHome(paths.appHome)}`);
-      console.log(`workspace:      ${shortenHome(paths.workspace)}`);
-      console.log('');
-      for (const c of changes) {
-        console.log(`  ${c.action.padEnd(9)} ${shortenHome(c.path)}`);
-        console.log(`            ↳ ${c.note}`);
-      }
-      console.log('');
-
-      if (!opts.apply) {
-        console.log('preview only — nothing was written. Re-run with --apply to write these changes.');
-        return;
-      }
-      // (ADR-087) the app's own token for the local API: made when it is connected, gone when it is removed
-      // (follow-up 1: the app names its own session id — the token may bind itself to one that is nobody else's)
-      if (opts.uninstall) removeExternalToken(SDS_AGENT);
-      else ensureExternalToken(SDS_AGENT, undefined, { open: true });
-      applyChanges(changes);
-      console.log(opts.uninstall ? 'removed.' : 'installed.');
-      if (!opts.uninstall) {
-        console.log('Restart 闪电说 (or just start a new message) and say 「有我的消息吗」 to test it.');
-      }
-    })();
+  .action(async (app: string | undefined, opts: { apply?: boolean; uninstall?: boolean; appHome?: string; port?: string; agent?: string; session?: string; title?: string; cwd?: string }) => {
+    if (app === 'sds') return (await import('./cli/connect-sds.js')).connectSds(opts);
+    if (app !== undefined) {
+      console.error(`error: unknown app "${app}" — supported: sds (闪电说)`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!opts.agent || !opts.session) {
+      console.error('error: connect an app (morse connect sds), or an external agent session: morse connect --agent <name> --session <id> [--title <title>] [--cwd <dir>]');
+      process.exitCode = 1;
+      return;
+    }
+    const ext = { agent: opts.agent, session: opts.session };
+    if (opts.uninstall) return unregisterExternal(ext);
+    return registerExternal({ ...ext, ...(opts.title ? { title: opts.title } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}) });
   });
-const sendCmd = program
-  .command('send')
+/** A session as the daemon names one it resolved a target to, or offers as a candidate. */
+type SessionLabel = { agent: string; title: string; sessionId: string; device?: string };
+/** `@[device/]agent:title` */
+const sessionLabel = (s: SessionLabel): string => `${atOf(s)}:${s.title}`;
+/** What the daemon answers to POST /api/send. */
+interface SendAnswer {
+  message?: Message;
+  /** where the message was queued for */
+  resolvedTarget?: SessionLabel;
+  error?: string;
+  /** with an error: the sessions the target may have meant */
+  candidates?: SessionLabel[];
+  /** a message with files sent in chunks: how many */
+  chunks?: number;
+  /** (ADR-081) the address of mine it is sent from, as the daemon understood it */
+  sentFrom?: unknown;
+}
+
+const sendCmd = program.command('send')
   .description('Send a message: to a contact (their remark), an address (morse.im/<address>[/<agent>]) or a session (@<agent>:<session>)')
   .argument('<target>', 'who: a contact\'s name (bob, bob/<agent>), morse.im/<handle>[/<agent>], me/<agent> (your own agent), or a session @<agent>[:<session>]')
   .argument('[message]', 'message text (or --text-file)')
@@ -1913,7 +1741,7 @@ const sendCmd = program
         process.exit(1);
       }
     }
-    const from: SessionRef = sessionArg ? await resolveOrExit(sessionArg) : { agent: 'user', sessionId: 'cli' };
+    const from: SessionRef = sessionArg ? await sessionOrExit(sessionArg) : { agent: 'user', sessionId: 'cli' };
 
     // prefer the daemon: its directory aggregates LAN peers, so @device/… resolves.
     // First contact with a person asks the relay (up to ~5 s for the connection + 15 s
@@ -1942,14 +1770,7 @@ const sendCmd = program
         );
         process.exit(1);
       }
-      const body = (await res.json()) as {
-        message?: Message;
-        resolvedTarget?: { agent: string; title: string; sessionId: string; device?: string };
-        error?: string;
-        candidates?: Array<{ agent: string; title: string; sessionId: string; device?: string }>;
-        chunks?: number;
-        sentFrom?: unknown;
-      };
+      const body = (await res.json()) as SendAnswer;
       if (res.ok && body.message && needFrom && body.sentFrom !== needFrom) {
         // (ADR-081 review N1) belt and braces — the daemon was asked first, so this is one that changed in between: it
         // queued the message without the sending address. Taken back if nobody started sending it yet.
@@ -1962,39 +1783,40 @@ const sendCmd = program
         );
         process.exit(1);
       }
-      if (res.ok && body.message && body.resolvedTarget) {
-        const t = body.resolvedTarget;
+      // queued: where to, and (with files sent in chunks) followed until it is there
+      const queued = res.ok ? body.message : undefined;
+      const t = body.resolvedTarget;
+      if (queued && t) {
         if (alsoNote) console.error(alsoNote);
         if (opts.json) {
           const mb = openMailbox();
-          const m = mb.getMessage(body.message.id) ?? body.message;
+          const m = mb.getMessage(queued.id) ?? queued;
           console.log(JSON.stringify({ queued: true, message: messageViewOf(mb, m), resolvedTarget: t, ...(body.chunks ? { chunks: body.chunks } : {}) }, null, 2));
           return;
         }
-        console.log(`queued ${body.message.id}`);
-        console.log(`  to: ${t.device ? `@${t.device}/` : '@'}${t.agent}:${t.title} [${t.sessionId.slice(0, 8)}]`);
-        const files = body.message.parts.flatMap((p) => p.files ?? []);
+        console.log(`queued ${queued.id}\n  to: ${sessionLabel(t)} [${t.sessionId.slice(0, 8)}]`);
+        const files = queued.parts.flatMap((p) => p.files ?? []);
         if (files.length) console.log(`  files: ${files.map((f) => `${f.name} (${formatBytes(f.size)})`).join(', ')}${body.chunks ? ` — ${body.chunks} chunks` : ''}`);
-        if (body.chunks && opts.wait !== false) await followTransfer(sendPort, body.message.id, body.chunks);
+        if (body.chunks && opts.wait !== false) await followTransfer(sendPort, queued.id, body.chunks);
         return;
       }
-      console.error(`error: ${body.error ?? `daemon returned ${res.status}`}`);
-      for (const c of body.candidates ?? []) {
-        console.error(`  candidate: ${c.device ? `@${c.device}/` : '@'}${c.agent}:${c.title}  [${c.sessionId.slice(0, 8)}]`);
-      }
+      // refused (a target it could not resolve, …): why, and the sessions it may have meant
+      const refusal = [`error: ${body.error ?? `daemon returned ${res.status}`}`, ...(body.candidates ?? []).map((c) => `  candidate: ${sessionLabel(c)}  [${c.sessionId.slice(0, 8)}]`)];
+      for (const line of refusal) console.error(line);
       process.exit(1);
     } catch (e) {
       if ((e as { cause?: { code?: string } })?.cause?.code !== 'ECONNREFUSED') {
         console.error(`error: unexpected answer from the daemon (${e instanceof Error ? e.message : String(e)}) — the message may still have been queued: check with  morse read --all`);
         process.exit(1);
       }
-      // daemon not running — local-only fallback (no LAN targets)
+      // No daemon: a session on this computer can still be written to — queued here, delivered once it starts.
+      // Another address can only be reached through the daemon.
       const { parseMorseAddress, hasRelayHost } = await import('./cluster/morse.js');
       if ((parseMorseAddress(target) && hasRelayHost(target)) || normalizeAddress(target) || fromAddress) {
         console.error(`error: the daemon is not running — messages to other addresses (${target}) go through it: morse start`);
         process.exit(1);
       }
-      const to = await resolveOrExit(target);
+      const to = await sessionOrExit(target);
       const mb = openMailbox();
       const m = mb.send({ from: { agent: from.agent, sessionId: from.sessionId }, to: { agent: to.agent, sessionId: to.sessionId }, text: message });
       if (opts.json) {
@@ -2002,9 +1824,8 @@ const sendCmd = program
         console.log(JSON.stringify({ queued: true, offline: true, message: messageViewOf(mb, m), resolvedTarget: { agent: to.agent, title: to.title, sessionId: to.sessionId } }, null, 2));
         return;
       }
-      console.log(`queued ${m.id} (daemon offline — local resolution only)`);
-      console.log(`  to: @${to.agent}:${to.title} [${to.sessionId.slice(0, 8)}]`);
-      console.log(`  delivery starts once the daemon is running (morse start)`);
+      const queuedHere = [`queued ${m.id} (daemon offline — local resolution only)`, `  to: ${sessionLabel(to)} [${to.sessionId.slice(0, 8)}]`, '  delivery starts once the daemon is running (morse start)'];
+      console.log(queuedHere.join('\n'));
     }
   });
 interface InboxOpts {
@@ -2018,19 +1839,14 @@ interface InboxOpts {
 }
 /** `morse read` with no <contact> (was `morse inbox`): to process, or every message with --all. */
 async function showInbox(opts: InboxOpts): Promise<void> {
-  const query: { toSession?: string; toAgent?: string; take?: boolean; all?: boolean } = {};
   if (opts.take && !opts.session && !opts.agent) {
     // ADR-048: an unscoped --take marked EVERY message delivered, outbound retries included
     console.error('error: --take needs a scope now: --session "@<agent>:<your session>" or --agent <name> (it only marks messages received there)');
     process.exit(1);
   }
-  if (opts.session) query.toSession = (await resolveOrExit(opts.session)).sessionId;
-  else if (opts.agent) {
-    query.toSession = 'inbox';
-    query.toAgent = opts.agent;
-  }
-  if (opts.take) query.take = true;
-  if (opts.all) query.all = true;
+  // whose mail: one session's, one agent's Morse mailbox (its 'inbox' session), or everyone's
+  const scope = opts.session ? { toSession: (await sessionOrExit(opts.session)).sessionId } : opts.agent ? { toSession: 'inbox', toAgent: opts.agent } : {};
+  const query = { ...scope, ...(opts.take ? { take: true } : {}), ...(opts.all ? { all: true } : {}) };
   const mailbox = openMailbox();
   // ADR-050: plain `morse message` (or --agent) is the to-process view; --session / --take / --all keep the old listing
   if (!opts.session && !opts.take && !opts.all) {
@@ -2054,10 +1870,7 @@ async function showInbox(opts: InboxOpts): Promise<void> {
     // (ADR-083 review R3: the address the MESSAGE belongs to — its contact's, found by the pair, never by the bare id)
     messages = messages.filter((m) => mailbox.addressOf(m) === mine.key);
   }
-  if (opts.json) {
-    console.log(JSON.stringify(messages, null, 2));
-    return;
-  }
+  if (opts.json) return console.log(JSON.stringify(messages, null, 2));
   // ADR-038: chunked messages still arriving — not in the inbox until every file is in and checked
   for (const t of listIncoming()) {
     console.log(
@@ -2101,19 +1914,6 @@ async function showInbox(opts: InboxOpts): Promise<void> {
   }
 }
 
-/** The sessions `--pull` / `--wait` act for: --session, else the ones in this directory. */
-async function sessionsHere(opts: { session?: string; cwd?: string }, quiet?: boolean): Promise<Array<{ id: string; label: string }>> {
-  if (opts.session) {
-    const s = await resolveOrExit(opts.session);
-    return [{ id: s.sessionId, label: `@${s.agent}:${s.title}` }];
-  }
-  const cwd = opts.cwd ?? process.cwd();
-  const { sessions } = await listAllSessions(directoryAdapters());
-  const matches = sessions.filter((s) => s.cwd === cwd);
-  if (matches.length === 0 && !quiet) console.log(`no session found for ${cwd} — open a session here, or pass --session "@<agent>:<fragment>"`);
-  return matches.map((s) => ({ id: s.sessionId, label: `@${s.agent}:${s.title}` }));
-}
-
 interface PullOpts {
   session?: string;
   cwd?: string;
@@ -2125,41 +1925,10 @@ interface PullOpts {
 /** `morse read --pull` (was `morse pull`): new messages for THIS session, from disk. */
 async function pullMessages(opts: PullOpts): Promise<void> {
   const mailbox = openMailbox();
-  const { collectInbox, recentExchange } = await import('./hooks/prompt-hook.js');
+  const { mailTargets, pullFor } = await import('./cli/session-mail.js');
   // messages to this computer's Morse agent(s) land in the 'inbox' session
-  const targets = opts.inbox ? [{ id: 'inbox', label: 'Morse inbox (the addresses here)' }] : await sessionsHere(opts, opts.quiet);
-  if (targets.length === 0) return;
-  // --history: read-only view of the recent exchange, so you can SEE what
-  // happened even after it was delivered headlessly and the cursor moved on.
-  if (opts.history) {
-    const limit = Number.parseInt(opts.limit ?? '15', 10) || 15;
-    let shown = false;
-    for (const t of targets) {
-      const text = recentExchange(mailbox, t.id, limit);
-      if (text) {
-        console.log(`===== ${t.label} =====`);
-        console.log(text);
-        console.log('');
-        shown = true;
-      }
-    }
-    if (!shown && !opts.quiet) console.log('no Morse history for this session yet.');
-    return;
-  }
-  let any = false;
-  for (const t of targets) {
-    // --inbox is an explicit read of the Morse mailbox: other people's text too, labelled
-    const text = collectInbox(mailbox, t.id, opts.inbox ? { foreign: 'full' } : {});
-    if (text) {
-      console.log(`===== ${t.label} =====`);
-      console.log(text);
-      console.log('');
-      any = true;
-    }
-  }
-  if (!any && !opts.quiet) {
-    console.log('no new Morse messages — run `morse read --pull --history` to see the recent exchange (delivered ones included).');
-  }
+  const targets = opts.inbox ? [{ id: 'inbox', label: 'Morse inbox (the addresses here)' }] : await mailTargets(opts, opts.quiet);
+  if (targets.length > 0) await pullFor(mailbox, targets, { ...opts, fullForeign: opts.inbox === true });
 }
 
 interface WaitOpts {
@@ -2171,63 +1940,14 @@ interface WaitOpts {
 /** `morse read --wait` (was `morse monitor`): block until a message for this session arrives, print it here. */
 async function waitForMessages(opts: WaitOpts): Promise<void> {
   const mailbox = openMailbox();
-  const { collectInbox } = await import('./hooks/prompt-hook.js');
-  const { heartbeat, clearMonitor } = await import('./daemon/monitor.js');
-  const targets = await sessionsHere(opts);
-  if (targets.length === 0) return;
-  const timeoutMs = (Number.parseInt(opts.timeout ?? '1800', 10) || 1800) * 1000;
-  const pollMs = Number.parseInt(opts.poll ?? '1500', 10) || 1500;
-  const deadline = Date.now() + timeoutMs;
-  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-  // clear heartbeats on ANY exit path (normal return, Ctrl-C, kill) so the
-  // daemon resumes normal delivery promptly instead of waiting for staleness
-  const cleanup = (): void => {
-    for (const t of targets) clearMonitor(t.id);
-  };
-  process.once('exit', cleanup);
-  process.once('SIGINT', () => process.exit(130));
-  process.once('SIGTERM', () => process.exit(143));
-  console.log(`waiting for messages to ${targets.map((t) => t.label).join(', ')}…`);
-  for (;;) {
-    for (const t of targets) heartbeat(t.id); // tell the daemon: don't resume-deliver to me
-    let got = false;
-    for (const t of targets) {
-      const text = collectInbox(mailbox, t.id);
-      if (text) {
-        console.log(`===== ${t.label} =====`);
-        console.log(text);
-        console.log('');
-        got = true;
-      }
-    }
-    if (got) {
-      cleanup();
-      return; // a message arrived — hand control back so the agent acts + replies, then waits again
-    }
-    if (Date.now() >= deadline) {
-      cleanup();
-      console.log('nothing arrived in the window — run `morse read --wait` again to keep waiting.');
-      return;
-    }
-    await sleep(pollMs);
-  }
+  const { mailTargets, waitFor } = await import('./cli/session-mail.js');
+  const targets = await mailTargets(opts);
+  if (targets.length > 0) await waitFor(mailbox, targets, opts);
 }
 
 /** `morse list --conversations` (was `morse conversations`). */
-function showConversations(opts: { json?: boolean }): void {
-  const convos = openMailbox().listConversations();
-  if (opts.json) {
-    console.log(JSON.stringify(convos, null, 2));
-    return;
-  }
-  if (convos.length === 0) {
-    console.log('no conversations yet — send a first message with morse send');
-    return;
-  }
-  for (const c of convos) {
-    const last = c.lastMessage ? ` — ${c.lastMessage.parts[0]?.text.slice(0, 40) ?? ''}` : '';
-    console.log(`@${c.a.agent}:${c.a.sessionId.slice(0, 8)} ↔ @${c.b.agent}:${c.b.sessionId.slice(0, 8)}  (${c.messageCount} msgs, ${formatRelativeTime(c.lastMessageAt)})${last}`);
-  }
+async function showConversations(opts: { json?: boolean }): Promise<void> {
+  (await import('./cli/listing.js')).listConversations(openMailbox(), opts);
 }
 
 const inboxOptions = (c: Command): Command =>

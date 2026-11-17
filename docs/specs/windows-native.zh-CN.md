@@ -1,6 +1,6 @@
 # Morse 原生支持 Windows：技术规格（方案稿）
 
-> 创建：2026-11-15 · 最后更新：2026-11-16（P5 前一半：Windows 上打开 WebRTC 直连）
+> 创建：2026-11-15 · 最后更新：2026-11-17（scripts/ 一节去掉已删的 smoke 脚本，ADR-093）
 
 > 2026-11-16：P5 的前一半（Windows 上打开 WebRTC 直连）见 4.2 节。
 >
@@ -100,7 +100,7 @@
 
 **第 1、2 期里 Windows 上自动更新是关的**：`update.auto` 在 `win32` 上按 false 处理，`morse update` 打印"重新运行 install.ps1"。直到 P3 做完。代价见风险 2。
 
-**`scripts/`**：15 个 `.sh`（`morse-e2e-*.sh`、`smoke.sh`、`lan-smoke.sh`、`install-daemon-launchd.sh`、`lib/test-release.sh`）全是 bash 的验收脚本，只在开发机上用，不随包发布（`package.json` 的 `files` 只有 `dist` `skills` `webui` `plugins`）。**不移植**；Windows 的验收用第 4 节每期的手工清单。`package.json` 的 `prepare`（`test -f dist/cli.js || npm run build`）在 `cmd.exe` 下 `test` 不存在 → 走 `||` 后半段多构建一次，不会失败，不改。
+**`scripts/`**：`.sh` 脚本（`morse-e2e-*.sh`、`install-daemon-launchd.sh`、`lib/test-release.sh`；`smoke.sh`、`lan-smoke.sh` 已于 2026-11-17 删除，ADR-093）全是 bash 的验收脚本，只在开发机上用，不随包发布（`package.json` 的 `files` 只有 `dist` `skills` `webui` `plugins`）。**不移植**；Windows 的验收用第 4 节每期的手工清单。`package.json` 的 `prepare`（`test -f dist/cli.js || npm run build`）在 `cmd.exe` 下 `test` 不存在 → 走 `||` 后半段多构建一次，不会失败，不改。
 
 ### 2.2 后台服务
 

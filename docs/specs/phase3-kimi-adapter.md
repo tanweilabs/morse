@@ -1,46 +1,25 @@
-# Phase 3 规格 — Kimi Code adapter（第五家：Moonshot 月之暗面）
+# Kimi Code 投递通道
 
-> 创建：2026-08-10 · 最后更新：2026-11-14
-> **名字说明（2026-11-14）**：文中的 `anyd`、`~/.anytoany/` 是当时的名字，属于历史写法，正文不改；命令行现在叫 `morse`，数据目录是 `~/.morse/`（ADR-033、ADR-035）。
-> 状态：已实施（本机 kimi 0.32.0 真机端到端通过：发现 7 会话 + 探针会话投递 + marker 回信干净解析）。母调研：[research-kimi-zcode-qcode.md](../research/research-kimi-zcode-qcode.md)
-> 动机：用户要用 MacBook 的 Codex ↔ Mac mini 终端里的 Kimi Code 协作（kimi 只能终端运行）。
+> 创建：2026-08-10 · 最后更新：2026-11-17（按现状重写）
+> 代码：`src/adapters/kimi.ts`。最初在 kimi 0.32.0 上实测；Kimi 的门铃调研见 [research-doorbell-kimi-zcode-opencode.md](../research/research-doorbell-kimi-zcode-opencode.md)。
 
-## 1. 发现（listSessions）
+## 找会话
 
-- 数据源：`$ANYTOANY_KIMI_BIN 无关` — 读 `~/.kimi-code/session_index.jsonl`（每行一条 JSON）。
-- **真实字段（v0.32.0 实测，仅三个）**：`sessionId`（`session_<uuid>`，resume 直接用）· `sessionDir`（会话目录绝对路径）· `workDir`（cwd）。**无标题、无时间戳**。
-- 映射：`sessionId` 原样 · `cwd = workDir` · `title = basename(workDir)`（80 截断，无则 `untitled`）· `lastActiveAt = stat(sessionDir).mtimeMs`（目录不存在则 0）。
-- 按 sessionId 去重（后行胜）、按 mtime 降序。索引缺失/不可读 → `[]`（未装 kimi 的机器静默跳过）。
-- 无需子代理过滤：kimi 子代理运行记录存于会话目录内 `agents/` 子目录，**不作为顶层 session 进索引**（与 codex/zcode 不同，反而更简单）。
+- 读 `~/.kimi-code/session_index.jsonl`，一行一条。实测只有三个字段：`sessionId`（形如 `session_<uuid>`，可以直接拿去续接）、`sessionDir`、`workDir`。没有标题，也没有时间。
+- 所以：目录 = `workDir`；标题 = 目录名（最长 80 字，没有就 `untitled`）；最近活跃 = `sessionDir` 的修改时间（目录不在了就算 0）。
+- 同一个 id 出现多次，以后面的为准；按最近活跃排序。坏行跳过；文件不存在（没装 Kimi）就当没有会话。
+- Kimi 的子代理记录放在会话目录里面，不进索引，不用额外过滤。
 
-## 2. 投递（deliver）
+## 投递
 
-- 引擎解析优先级：`ANYTOANY_KIMI_BIN` → PATH 上 `kimi` → `~/.kimi-code/bin/kimi`（单二进制，163MB）。
-- argv：`kimi -S <sessionId> -p <envelope> --output-format stream-json`（cwd = workDir，有则传）。
-- **权限模型与 ZCode 相反、无需提权**：默认 `-p` 已自动执行工具（实测创建文件成功），非只读；且 **`-p` 不能与 `-y`/`--yolo`/`--auto`/`--plan` 组合**（CLI 直接报错 `Cannot combine --prompt with --yolo`，v0.32.0 实测）——adapter 绝不传这些旗标，机主提权在此不适用也不可用。
-- 超时 300s；失败取 stderr 尾部 500 字符。
+- 找 `kimi` 的顺序：环境变量 `MORSE_KIMI_BIN`（旧名 `ANYTOANY_KIMI_BIN` 仍认）→ PATH 里的 `kimi` → `~/.kimi-code/bin/kimi`。都没有就报「kimi not found」。
+- 命令：`kimi -S <sessionId> -p <信封> --output-format stream-json`，在会话的目录里跑，最长 5 分钟。退出码非 0 就失败，错误里带 stderr 的最后 500 字。
+- 不加任何提权旗标：`-p` 默认就会执行工具；而且 `-p` 和 `-y` / `--yolo` / `--auto` / `--plan` 一起用 CLI 会直接报错，所以机主提权这件事在 Kimi 上不存在。
 
-## 3. 回信解析（关键）
+## 取回信
 
-kimi `--output-format stream-json` 每行一条消息 JSON。实测一个「用工具的回合」形状：
+`stream-json` 每行一个 JSON。一个用了工具的回合大致是：一条内容为空的 assistant（准备调工具）、一条 `tool`（工具结果）、一条带回信标记的 assistant、最后一条 `meta`（「To resume…」提示）。只把内容非空的 `assistant` 行拼起来当回答，工具结果和 `meta` 提示都不要，否则会混进回信里。不用纯文本输出，因为它每行带 `• ` 前缀。
 
-```
-{"role":"assistant","content":""}                      ← 将调用工具，空正文
-{"role":"tool","content":"Wrote 1 bytes to x.txt"}     ← 工具结果
-{"role":"assistant","content":"<<<ANYTOANY_REPLY>>> …"}← 终态 assistant，含 marker
-{"role":"meta","type":"session.resume_hint","content":"To resume: kimi -r …"} ← 尾部提示
-```
+## 没做的
 
-adapter 只取 `role==='assistant'` 且 content 非空的行拼接为 `output`——**排除 tool 结果与 meta resume_hint**，否则「To resume this session…」会污染 marker 之后的回信（text 模式还有 `• ` 前缀，故用 stream-json）。
-
-## 4. 联动面
-
-- `defaultAdapters()` 注册第五家 → 目录扫描、@any 物化（`any-kimi-*` / 跨机 `any-<device>-kimi-*`）、hook digest、webui 自动生效。
-- webui：`kimi` 品牌色/logo 早已在 25 家品牌库中（`#7C3AED`），无需新增。
-- 收件可见性（P3 跟踪）：kimi 有 19 事件 hooks（`UserPromptSubmit` 可注入 context，与 Claude 同构）；实时通道升级路径为 `kimi web` REST/WS（`POST /sessions/{id}/prompts` + `:steer` + 程序化审批 `/approvals`）——同类最强，留待 P3。
-
-## 5. 验收
-
-1. 单测：fixture `session_index.jsonl` → 字段映射/mtime 排序/缺失返回空/坏行跳过；deliver 断言 argv（stream-json、无 -y/--auto）、stream-json 回信解析（排除 tool+meta）、stderr 尾部。（6 测试，全绿）
-2. 真机（本机 kimi 0.32.0）：`listSessions` 发现真实会话；向 scratch 探针会话真实投递，kimi 执行 + marker 回信干净解析（不碰用户真实会话，实测通过）。
-3. 跨机：mini 更新 anytoany 后，MacBook 侧 `anyd list` 出现 `@<mini>/kimi/...`；Codex→mini Kimi 首条真实消息由用户发起验证。
+Kimi 有和 Claude 同类的 `UserPromptSubmit` hook，`kimi web` 还有 REST/WS 接口（发消息、追加、审批），都可以做「会话开着时直接送到」。目前没做，见上面的门铃调研。

@@ -1,57 +1,70 @@
 import { spawn } from 'node:child_process';
 
+/** Desktop alerts the daemon raises about cross-agent traffic. */
 export interface Notifier {
-  /** Notify the user that a session got new cross-agent traffic. Throttled per session. */
+  /** Tell the user a session received a message or replied. Rate-limited per session. */
   sessionActivity(agent: string, sessionTitle: string, sessionId: string, direction: 'received' | 'replied'): void;
-  /** Loud alert: delivery to `agent` was refused because its CLI is out of date (ADR-025). */
+  /** Loud alert: a delivery to `agent` was refused because its CLI is too old (ADR-025). */
   versionMismatch(agent: string, detail: string): void;
 }
 
-const THROTTLE_MS = 60_000;
-/** One mismatch alert per agent per window — it stays broken until upgraded, no need to nag per message. */
-const MISMATCH_THROTTLE_MS = 10 * 60_000;
-const DETAIL_MAX = 220;
+const SESSION_QUIET_MS = 60_000;
+/** A stale CLI stays stale until upgraded, so one alert per agent per ten minutes is plenty. */
+const MISMATCH_QUIET_MS = 600_000;
+const MAX_BODY_CHARS = 220;
 
-/** Post a macOS notification (no-op elsewhere or when disabled). */
+/** Quote a value for an AppleScript string literal. */
+function appleScriptString(text: string): string {
+  return `"${text.replace(/[\\"]/g, (ch) => `\\${ch}`)}"`;
+}
+
+/** Show a macOS notification banner. Silently does nothing on other platforms or on failure. */
 export function postNotification(title: string, body: string): void {
   if (process.platform !== 'darwin') return;
-  const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const child = spawn('osascript', ['-e', `display notification "${esc(body)}" with title "${esc(title)}"`], {
-    stdio: 'ignore',
-    detached: true,
-  });
-  child.unref();
-  child.on('error', () => {
-    /* notification is best-effort — never break delivery over it */
-  });
+  const script = `display notification ${appleScriptString(body)} with title ${appleScriptString(title)}`;
+  const proc = spawn('osascript', ['-e', script], { stdio: 'ignore', detached: true });
+  // Best-effort: a missing osascript must never affect message delivery.
+  proc.on('error', () => undefined);
+  proc.unref();
+}
+
+/**
+ * A gate that lets one event per key through every `quietMs`.
+ * The first event for a key always passes.
+ */
+function rateLimiter(quietMs: number, clock: () => number): (key: string) => boolean {
+  const passedAt = new Map<string, number>();
+  return (key) => {
+    const t = clock();
+    const prev = passedAt.get(key);
+    if (prev !== undefined && t - prev < quietMs) return false;
+    passedAt.set(key, t);
+    return true;
+  };
 }
 
 export function createNotifier(opts: { enabled: boolean; now?: () => number } = { enabled: true }): Notifier {
-  const lastPerSession = new Map<string, number>();
-  const lastMismatchPerAgent = new Map<string, number>();
-  const now = opts.now ?? Date.now;
+  const clock = opts.now ?? Date.now;
+  const sessionGate = rateLimiter(SESSION_QUIET_MS, clock);
+  const mismatchGate = rateLimiter(MISMATCH_QUIET_MS, clock);
+
   return {
-    versionMismatch(agent, detail) {
-      if (!opts.enabled) return;
-      const ts = now();
-      if (ts - (lastMismatchPerAgent.get(agent) ?? -Infinity) < MISMATCH_THROTTLE_MS) return;
-      lastMismatchPerAgent.set(agent, ts);
-      const upgrade = /upgrade: (.+?) —/.exec(detail)?.[1];
-      postNotification(
-        `Morse — ${agent} CLI out of date, message NOT delivered`,
-        upgrade ? `Run: ${upgrade}` : detail.slice(0, DETAIL_MAX),
-      );
-    },
     sessionActivity(agent, sessionTitle, sessionId, direction) {
-      if (!opts.enabled) return;
-      const ts = now();
-      const last = lastPerSession.get(sessionId) ?? 0;
-      if (ts - last < THROTTLE_MS) return;
-      lastPerSession.set(sessionId, ts);
-      const verb = direction === 'received' ? 'received a new message' : 'sent a reply';
+      if (!opts.enabled || !sessionGate(sessionId)) return;
+      const what = direction === 'replied' ? 'sent a reply' : 'received a new message';
       postNotification(
         'Morse',
-        `@${agent}:${sessionTitle} ${verb} — reopen the session to see it (or the web console: morse console)`,
+        `@${agent}:${sessionTitle} ${what} — reopen the session to see it (or the web console: morse console)`,
+      );
+    },
+
+    versionMismatch(agent, detail) {
+      if (!opts.enabled || !mismatchGate(agent)) return;
+      // The adapter's detail text carries "upgrade: <command> —"; surface just the command when present.
+      const command = detail.match(/upgrade: (.+?) —/)?.[1];
+      postNotification(
+        `Morse — ${agent} CLI out of date, message NOT delivered`,
+        command === undefined ? detail.slice(0, MAX_BODY_CHARS) : `Run: ${command}`,
       );
     },
   };

@@ -1,42 +1,66 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { dirname, join } from 'node:path';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { clearPid, commandLineOf, isAlive, isMorseDaemon, looksLikeMorseDaemon, readPid, runningDaemonPid, writePid } from '../src/daemon/pidfile.js';
+import { dataDir } from '../src/home.js';
+import { DAEMON_STUB_ENTRY, daemonStub, killStub, killStubs, unrelatedStub } from './helpers/stub-process.js';
 
-const home = mkdtempSync(join(tmpdir(), 'anytoany-pid-'));
+const testHome = mkdtempSync(join(tmpdir(), 'morse-pidfile-'));
+const pidFilePath = () => join(dataDir(), 'daemon.pid');
 
 beforeAll(() => {
-  process.env.ANYTOANY_HOME = home;
+  process.env.ANYTOANY_HOME = testHome;
 });
 afterAll(async () => {
   await killStubs();
   delete process.env.ANYTOANY_HOME;
-  rmSync(home, { recursive: true, force: true });
+  rmSync(testHome, { recursive: true, force: true });
 });
 
-import { clearPid, commandLineOf, isAlive, isMorseDaemon, looksLikeMorseDaemon, readPid, runningDaemonPid, writePid } from '../src/daemon/pidfile.js';
-import { DAEMON_STUB_ENTRY, daemonStub, killStub, killStubs, unrelatedStub } from './helpers/stub-process.js';
+describe('daemon.pid read / write / clear', () => {
+  beforeEach(() => clearPid());
 
-describe('pid file ownership', () => {
-  it('round-trips a pid and checks liveness', () => {
-    writePid(123);
-    expect(readPid()).toBe(123);
-    expect(isAlive(process.pid)).toBe(true);
-    expect(isAlive(999999)).toBe(false);
+  it('writes the pid as plain text, creating the data folder', () => {
+    rmSync(dirname(pidFilePath()), { recursive: true, force: true });
+    writePid(4242);
+    expect(readFileSync(pidFilePath(), 'utf8')).toBe('4242');
+    expect(readPid()).toBe(4242);
   });
 
-  it("an exiting process must not clobber another daemon's pid file", () => {
-    writePid(123);
-    clearPid(456); // crashed starter's exit handler — not the owner
-    expect(readPid()).toBe(123);
-    clearPid(123); // the owner exits
+  it('defaults to the current process', () => {
+    writePid();
+    expect(readPid()).toBe(process.pid);
+  });
+
+  it('reads null when the file is missing or not a number', () => {
     expect(readPid()).toBeNull();
+    mkdirSync(dirname(pidFilePath()), { recursive: true });
+    writeFileSync(pidFilePath(), 'not-a-pid');
+    expect(readPid()).toBeNull();
+    writeFileSync(pidFilePath(), ' 77\n');
+    expect(readPid()).toBe(77);
   });
 
-  it('unconditional clear still works (anyd stop cleanup)', () => {
-    writePid(789);
+  it('clearPid(own) keeps a file that records somebody else', () => {
+    writePid(1001);
+    clearPid(2002);
+    expect(readPid()).toBe(1001);
+    clearPid(1001);
+    expect(existsSync(pidFilePath())).toBe(false);
+  });
+
+  it('clearPid() removes the file whoever it names, and tolerates a missing one', () => {
+    writePid(3003);
     clearPid();
     expect(readPid()).toBeNull();
+    expect(() => clearPid()).not.toThrow();
+    expect(() => clearPid(5)).not.toThrow();
+  });
+
+  it('isAlive probes the process table', () => {
+    expect(isAlive(process.pid)).toBe(true);
+    expect(isAlive(999_999)).toBe(false);
   });
 });
 

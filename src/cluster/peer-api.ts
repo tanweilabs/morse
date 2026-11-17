@@ -4,124 +4,132 @@ import type { Mailbox, SessionRef } from '../mailbox/mailbox.js';
 import type { TrustedDevice } from './trust.js';
 
 /**
- * Routes a paired device may call (ADR-028). Reached only through the mutual-TLS
- * peer server, which has already pinned the caller to an entry in our trust list —
- * so `peer` here is authenticated, and its trusted name (not anything in the body)
- * is what we record as the sending device.
+ * The `/api/peer/*` routes of the device-ID LAN (ADR-028). No daemon serves them since ADR-091
+ * stage 1; the handler stays as the reference for how such a caller's mail is filed.
+ *
+ * The caller arrives already authenticated: the transport matched its certificate to a row of the
+ * trust list and passes that row in. The sending device is therefore recorded under the row's name,
+ * whatever the request body says.
  */
 
 export interface PeerApiOptions {
   selfDevice: string;
   selfId?: string;
   mailbox: Mailbox;
-  /** Local-only directory (no peer aggregation) served to peers. */
+  /** This computer's own sessions (never other devices'). */
   localDirectory: () => Promise<SessionInfo[]>;
-  /** Tell the local console something changed. */
+  /** Called after a message was filed. */
   onChange?: () => void;
-  /** Morse over the LAN (ADR-034): file a Morse message from this trusted device.
-   *  A getter because the Morse layer starts after the LAN layer. */
+  /** Where a Morse message handed over on the LAN goes (ADR-034); a getter, as Morse starts later than the LAN. */
   morseInbound?: () => MorseInbound | undefined;
-  /** ADR-077: a trusted device's VERIFIED address (its pinned certificate) — picks the contact its mail is filed under. */
+  /** (ADR-077) The verified address of a trusted device; it decides which contact the mail is filed under. */
   addressOf?: (deviceId: string) => string | null;
 }
 
-/** Files one Morse message handed over directly; answers with an HTTP status + body. */
+/** Takes one Morse message from a trusted device; answers with the HTTP status and body to send back. */
 export type MorseInbound = (peer: TrustedDevice, body: unknown) => Promise<{ status: number; body: unknown }>;
 
-const MAX_BODY_BYTES = 5 * 1024 * 1024;
+type Handler = (req: IncomingMessage, res: ServerResponse, peer: TrustedDevice) => Promise<void>;
 
-function json(res: ServerResponse, status: number, body: unknown): void {
+/** Bodies larger than this are refused while being read. */
+const BODY_LIMIT = 5 * 1024 * 1024;
+
+function send(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(payload));
 }
 
-async function readBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const c of req) {
-    size += (c as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(c as Buffer);
+/** The request body as JSON; an empty body reads as `{}`. */
+async function jsonBody(req: IncomingMessage): Promise<unknown> {
+  const parts: Buffer[] = [];
+  let total = 0;
+  for await (const part of req) {
+    const bytes = part as Buffer;
+    total += bytes.length;
+    if (total > BODY_LIMIT) throw new Error('request body too large');
+    parts.push(bytes);
   }
-  const raw = Buffer.concat(chunks).toString('utf8');
-  return raw ? JSON.parse(raw) : {};
+  const text = Buffer.concat(parts).toString('utf8');
+  return text === '' ? {} : JSON.parse(text);
 }
 
-const isSessionRef = (v: unknown): v is SessionRef =>
-  typeof v === 'object' &&
-  v !== null &&
-  typeof (v as SessionRef).agent === 'string' &&
-  typeof (v as SessionRef).sessionId === 'string' &&
-  (v as SessionRef).sessionId.length > 0;
+/** An agent plus a non-empty session id. */
+function sessionRef(value: unknown): SessionRef | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const { agent, sessionId } = value as Record<string, unknown>;
+  return typeof agent === 'string' && typeof sessionId === 'string' && sessionId !== '' ? (value as SessionRef) : null;
+}
 
-export function createPeerApiHandler(
-  opts: PeerApiOptions,
-): (req: IncomingMessage, res: ServerResponse, peer: TrustedDevice) => Promise<void> {
+const hasSealedEnvelope = (value: unknown): boolean => typeof value === 'object' && value !== null && 'sealedV3' in value;
+
+export function createPeerApiHandler(opts: PeerApiOptions): Handler {
+  /** POST /api/peer/messages: a plain message, filed under the authenticated device. */
+  const fileMessage: Handler = async (req, res, peer) => {
+    const body = (await jsonBody(req)) as Record<string, unknown>;
+    const from = sessionRef(body.from);
+    const to = sessionRef(body.to);
+    if (!from || !to || typeof body.text !== 'string') {
+      send(res, 400, { error: 'expected {contextId?, from, to, text}' });
+      return;
+    }
+    const contactId = opts.mailbox.contacts.filingContact({ address: opts.addressOf?.(peer.id) ?? null, deviceId: peer.id }, peer.name, peer.tier);
+    const contextId = typeof body.contextId === 'string' ? body.contextId : '';
+    const message = opts.mailbox.send({
+      from: { agent: from.agent, sessionId: from.sessionId, device: peer.name },
+      // (ADR-048) someone else's device names no session here: its mail waits in the agent's inbox
+      to: { agent: to.agent, sessionId: peer.tier === 'owner' ? to.sessionId : 'inbox' },
+      text: body.text,
+      via: 'relay',
+      fromTier: peer.tier,
+      ...(contactId ? { contactId } : {}),
+      ...(contextId ? { contextId } : {}),
+    });
+    opts.onChange?.();
+    send(res, 201, { message });
+  };
+
+  /**
+   * POST /api/peer/morse (plaintext) and /api/peer/morse3 (a sealed v3 envelope, ADR-073): what the
+   * relay would carry, handed straight to the Morse layer. Both tiers may send.
+   */
+  const handOver = async (req: IncomingMessage, res: ServerResponse, peer: TrustedDevice, sealedRoute: boolean): Promise<void> => {
+    const inbound = opts.morseInbound?.();
+    if (!inbound) {
+      send(res, 404, { error: 'Morse is not enabled on this device' });
+      return;
+    }
+    const body = await jsonBody(req);
+    if (sealedRoute !== hasSealedEnvelope(body)) {
+      send(res, 400, { error: sealedRoute ? 'expected {sealedV3: <v3 envelope>}' : 'a sealed envelope goes to /api/peer/morse3' });
+      return;
+    }
+    const answer = await inbound(peer, body);
+    send(res, answer.status, answer.body);
+  };
+
   return async (req, res, peer) => {
     const path = new URL(req.url ?? '/', 'https://peer').pathname;
-
-    if (req.method === 'GET' && path === '/api/peer/info') {
-      json(res, 200, { device: opts.selfDevice, ...(opts.selfId ? { id: opts.selfId } : {}) });
-      return;
-    }
-    // Morse: someone else's device may hand us messages, nothing more — it must not
-    // read this device's session directory.
+    // a device of someone else may send, but never sees this computer's sessions — whatever the method
     if (peer.tier === 'peer' && path === '/api/peer/sessions') {
-      json(res, 403, { error: 'peer-tier devices may only send messages' });
+      send(res, 403, { error: 'peer-tier devices may only send messages' });
       return;
     }
-    if (req.method === 'GET' && path === '/api/peer/sessions') {
-      json(res, 200, { sessions: await opts.localDirectory() });
-      return;
+    const route = `${req.method ?? ''} ${path}`;
+    switch (route) {
+      case 'GET /api/peer/info':
+        send(res, 200, { device: opts.selfDevice, ...(opts.selfId ? { id: opts.selfId } : {}) });
+        return;
+      case 'GET /api/peer/sessions':
+        send(res, 200, { sessions: await opts.localDirectory() });
+        return;
+      case 'POST /api/peer/messages':
+        return fileMessage(req, res, peer);
+      case 'POST /api/peer/morse':
+        return handOver(req, res, peer, false);
+      case 'POST /api/peer/morse3':
+        return handOver(req, res, peer, true);
+      default:
+        send(res, 404, { error: 'not found' });
     }
-    if (req.method === 'POST' && path === '/api/peer/messages') {
-      const body = (await readBody(req)) as { contextId?: unknown; from?: unknown; to?: unknown; text?: unknown };
-      if (!isSessionRef(body.from) || !isSessionRef(body.to) || typeof body.text !== 'string') {
-        json(res, 400, { error: 'expected {contextId?, from, to, text}' });
-        return;
-      }
-      const m = opts.mailbox.send({
-        // the authenticated device, not whatever the body claims
-        from: { agent: body.from.agent, sessionId: body.from.sessionId, device: peer.name },
-        // target is local here; another person's device never picks a session (ADR-048)
-        to: peer.tier === 'owner' ? { agent: body.to.agent, sessionId: body.to.sessionId } : { agent: body.to.agent, sessionId: 'inbox' },
-        text: body.text,
-        via: 'relay',
-        fromTier: peer.tier,
-        // ADR-077: by the caller's verified address, never by anything in the body
-        ...(() => {
-          const contactId = opts.mailbox.contacts.filingContact({ address: opts.addressOf?.(peer.id) ?? null, deviceId: peer.id }, peer.name, peer.tier);
-          return contactId ? { contactId } : {};
-        })(),
-        ...(typeof body.contextId === 'string' && body.contextId ? { contextId: body.contextId } : {}),
-      });
-      opts.onChange?.();
-      json(res, 201, { message: m });
-      return;
-    }
-    // Morse over the LAN: same message the relay would carry, minus the sealing —
-    // mutual TLS already proves which trusted device is calling (both tiers may send).
-    // ADR-073: the same, as a sealed v3 envelope ({sealedV3}) — signed and encrypted end to end
-    // on top of the mutual TLS; the Morse layer checks it was sealed by this very device
-    if (req.method === 'POST' && (path === '/api/peer/morse' || path === '/api/peer/morse3')) {
-      const inbound = opts.morseInbound?.();
-      if (!inbound) {
-        json(res, 404, { error: 'Morse is not enabled on this device' });
-        return;
-      }
-      const raw = await readBody(req);
-      if (path === '/api/peer/morse3' && (raw === null || typeof raw !== 'object' || !('sealedV3' in raw))) {
-        json(res, 400, { error: 'expected {sealedV3: <v3 envelope>}' });
-        return;
-      }
-      if (path === '/api/peer/morse' && raw !== null && typeof raw === 'object' && 'sealedV3' in raw) {
-        json(res, 400, { error: 'a sealed envelope goes to /api/peer/morse3' });
-        return;
-      }
-      const r = await inbound(peer, raw);
-      json(res, r.status, r.body);
-      return;
-    }
-    json(res, 404, { error: 'not found' });
   };
 }

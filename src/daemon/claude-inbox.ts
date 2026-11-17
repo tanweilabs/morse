@@ -1,29 +1,28 @@
-import { isPeerMessage } from '../peer-framing.js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { createConnection } from 'node:net';
+import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Mailbox } from '../mailbox/mailbox.js';
+import { isPeerMessage } from '../peer-framing.js';
 
-/**
- * The Claude doorbell (ADR-027).
- *
- * Claude Code v2.1.224+ gives every session — desktop App ones included — a local
- * inbox: a Unix socket registered in `~/.claude/sessions/<pid>.json`. A line written
- * to it makes an idle session start a turn (a busy one reads it between tool calls),
- * and that turn fires UserPromptSubmit, i.e. Morse's existing pull hook.
- *
- * So the doorbell carries NO message content — just "you have mail". The message
- * stays pending in the mailbox and the hook injects it with the usual framing and
- * `anyd reply` path. If the frame is held (a bypass-mode receiver without
- * `crossSessionInbound: accept`) or lost, nothing is lost: the hook still delivers
- * it on the user's next prompt — the pre-ADR-027 behaviour.
- *
- * We never read the `<pid>.*.key` tokens next to the registry: a token would make
- * the frame count as the session's own child and skip its inbound controls.
- * Verified live on 2.1.296, 2026-10-13. The wire format is the community-captured
- * one (agents-can-communicate #130), not an official spec — hence fail-soft.
- */
+// The doorbell (ADR-027): waking a running Claude Code session through its own inbox.
+//
+// Since Claude Code 2.1.224 each running session — the desktop App's too — lists a
+// local Unix socket in ~/.claude/sessions/<pid>.json. A JSON line written there
+// starts a turn in an idle session (a busy one picks it up between tool calls),
+// and that turn runs UserPromptSubmit — the hook through which Morse already
+// hands a session its mail.
+//
+// So the line only says "mail is waiting"; the mail stays pending and arrives
+// through the hook, framed as usual and answerable with `morse reply`. When a
+// session holds the line (bypass mode without `crossSessionInbound: accept`) or
+// the line is lost, the hook still delivers on the user's next prompt.
+//
+// The `<pid>.*.key` files beside the registry are never read: with one of those
+// the line would pass as the session's own child and bypass its inbound rules.
+// The line format follows the community capture (agents-can-communicate #130);
+// it is not documented, so every step here fails soft. Checked against 2.1.296
+// on 2026-10-13.
 
 export interface InboxEntry {
   pid: number;
@@ -33,133 +32,147 @@ export interface InboxEntry {
   version?: string;
 }
 
-const DEFAULT_TTL_MS = 2_000;
-const RING_TIMEOUT_MS = 3_000;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const REGISTRY_FILE = /^\d+\.json$/;
 
-function pidAlive(pid: number): boolean {
+/** Signal 0 only asks whether the process exists. EPERM (someone else's process) counts as not ours. */
+function processExists(pid: number): boolean {
   try {
-    process.kill(pid, 0);
-    return true;
+    return process.kill(pid, 0);
   } catch {
-    // ESRCH = gone; EPERM = another user's process — not one of our sessions either way
     return false;
   }
 }
 
-function parseEntry(raw: string): InboxEntry | null {
+/** One registry file's text as an inbox, or null when it does not describe a usable one. */
+function readRegistryEntry(text: string): InboxEntry | null {
+  let data: Record<string, unknown>;
   try {
-    const d = JSON.parse(raw) as Record<string, unknown>;
-    const { pid, sessionId, messagingSocketPath, status, version } = d;
-    if (typeof pid !== 'number' || typeof sessionId !== 'string' || !UUID_RE.test(sessionId)) return null;
-    if (typeof messagingSocketPath !== 'string' || !messagingSocketPath) return null;
-    return {
-      pid,
-      sessionId,
-      socketPath: messagingSocketPath,
-      ...(typeof status === 'string' ? { status } : {}),
-      ...(typeof version === 'string' ? { version } : {}),
-    };
+    data = JSON.parse(text) as Record<string, unknown>;
   } catch {
     return null;
   }
+  if (data === null || typeof data !== 'object') return null;
+  const pid = data['pid'];
+  const sessionId = data['sessionId'];
+  const socketPath = data['messagingSocketPath'];
+  if (typeof pid !== 'number') return null;
+  if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return null;
+  if (typeof socketPath !== 'string' || socketPath === '') return null;
+  const entry: InboxEntry = { pid, sessionId, socketPath };
+  if (typeof data['status'] === 'string') entry.status = data['status'];
+  if (typeof data['version'] === 'string') entry.version = data['version'];
+  return entry;
 }
 
 export interface InboxRegistryOptions {
-  /** `~/.claude/sessions` */
+  /** The session registry folder; default ~/.claude/sessions. */
   dir?: string;
   isAlive?: (pid: number) => boolean;
   ttlMs?: number;
   now?: () => number;
 }
 
-/** Cached probe: sessionId → inbox, for Claude sessions that are running right now. */
+/**
+ * A probe for the inboxes of Claude sessions running right now, keyed by session
+ * id. The result is reused for `ttlMs` (2 s) so hot paths can call it freely.
+ */
 export function createClaudeInboxRegistry(options: InboxRegistryOptions = {}): () => Map<string, InboxEntry> {
   const dir = options.dir ?? join(homedir(), '.claude', 'sessions');
-  const isAlive = options.isAlive ?? pidAlive;
-  const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
-  const now = options.now ?? Date.now;
-  let cached: { at: number; map: Map<string, InboxEntry> } | null = null;
-  return () => {
-    const t = now();
-    if (cached && t - cached.at < ttlMs) return cached.map;
-    const map = new Map<string, InboxEntry>();
-    let names: string[] = [];
+  const alive = options.isAlive ?? processExists;
+  const ttlMs = options.ttlMs ?? 2_000;
+  const clock = options.now ?? Date.now;
+
+  const scan = (): Map<string, InboxEntry> => {
+    const found = new Map<string, InboxEntry>();
+    let names: string[];
     try {
-      names = readdirSync(dir).filter((n) => /^\d+\.json$/.test(n));
+      names = readdirSync(dir);
     } catch {
-      // no ~/.claude/sessions — Claude Code too old or not installed
+      return found; // no ~/.claude/sessions: Claude Code missing or older than the inbox
     }
     for (const name of names) {
-      let raw: string;
+      if (!REGISTRY_FILE.test(name)) continue;
+      let text: string;
       try {
-        raw = readFileSync(join(dir, name), 'utf8');
+        text = readFileSync(join(dir, name), 'utf8');
       } catch {
         continue;
       }
-      const entry = parseEntry(raw);
-      // a crashed session leaves its file behind — require a live pid AND the socket
-      if (entry && isAlive(entry.pid) && existsSync(entry.socketPath)) map.set(entry.sessionId, entry);
+      const entry = readRegistryEntry(text);
+      // a session that crashed leaves its file: trust it only while the pid runs and the socket is there
+      if (entry !== null && alive(entry.pid) && existsSync(entry.socketPath)) found.set(entry.sessionId, entry);
     }
-    cached = { at: t, map };
-    return map;
+    return found;
+  };
+
+  let last: Map<string, InboxEntry> | undefined;
+  let lastAt = 0;
+  return () => {
+    const at = clock();
+    if (last === undefined || at - lastAt >= ttlMs) {
+      last = scan();
+      lastAt = at;
+    }
+    return last;
   };
 }
 
-/** One newline-terminated inbox frame: "you have mail", never the mail itself. */
+/** The line written to a session's inbox: that mail is waiting, never the mail itself. Ends with a newline. */
 export function buildDoorbellFrame(input: { messageIds: string[]; fromLabel: string }): string {
-  const n = input.messageIds.length;
-  const content = [
-    `[Morse] Doorbell: ${n} new cross-agent message${n === 1 ? '' : 's'} for this session (from ${input.fromLabel}).`,
-    `The Morse inbox hook attaches ${n === 1 ? 'it' : 'them'} to this turn — handle ${n === 1 ? 'it' : 'them'} there.`,
-    `If nothing from Morse is attached, run: morse read --pull`,
-  ].join('\n');
-  const frame = {
-    type: 'user',
-    message: { role: 'user', content },
-    // compatibility: an identifier in a file Claude Code reads — kept as older releases wrote it (ADR-075)
-    msg_id: `anytoany-${input.messageIds[0] ?? 'wake'}`,
-    priority: 'next',
-  };
-  return `${JSON.stringify(frame)}\n`;
+  const count = input.messageIds.length;
+  const one = count === 1;
+  const text =
+    `[Morse] Doorbell: ${count} new cross-agent message${one ? '' : 's'} for this session (from ${input.fromLabel}).\n` +
+    `The Morse inbox hook attaches ${one ? 'it' : 'them'} to this turn — handle ${one ? 'it' : 'them'} there.\n` +
+    'If nothing from Morse is attached, run: morse read --pull';
+  return (
+    JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: text },
+      // the id keeps the prefix older releases used: it lands in files Claude Code reads (ADR-075)
+      msg_id: `anytoany-${input.messageIds[0] ?? 'wake'}`,
+      priority: 'next',
+    }) + '\n'
+  );
 }
 
-/** Write one frame to a session's inbox socket. Never throws. */
-export function ringInbox(
-  socketPath: string,
-  frame: string,
-  timeoutMs: number = RING_TIMEOUT_MS,
-): Promise<{ ok: boolean; error?: string }> {
+/** Send `frame` to the inbox socket at `socketPath`. Resolves with the outcome; never rejects. */
+export function ringInbox(socketPath: string, frame: string, timeoutMs: number = 3_000): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
-    let settled = false;
-    const done = (r: { ok: boolean; error?: string }) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
+    let open = true;
+    const socket = connect(socketPath);
+    const finish = (outcome: { ok: boolean; error?: string }): void => {
+      if (!open) return; // the first outcome wins; later errors or the timer change nothing
+      open = false;
+      clearTimeout(deadline);
       socket.destroy();
-      resolve(r);
+      resolve(outcome);
     };
-    const socket = createConnection(socketPath);
-    const timer = setTimeout(() => done({ ok: false, error: `timed out after ${timeoutMs}ms` }), timeoutMs);
-    socket.on('error', (e) => done({ ok: false, error: e.message }));
-    socket.on('connect', () => {
-      socket.end(frame, () => done({ ok: true }));
-    });
+    const deadline = setTimeout(() => finish({ ok: false, error: `timed out after ${timeoutMs}ms` }), timeoutMs);
+    socket.on('error', (err) => finish({ ok: false, error: err.message }));
+    socket.once('connect', () => socket.end(frame, () => finish({ ok: true })));
   });
 }
 
 /**
- * Will a ring actually wake anyone? Verified 2026-10-13: with the user-level default
- * `permissions.defaultMode: "bypassPermissions"` and no `crossSessionInbound`, every
- * session holds the frame (`peer_message_hold`, cause `no-mode-asserted`) and the
- * desktop App can't show the approval dialog — the ring only leaves held notices
- * behind. In that configuration we don't ring at all; the pull hook delivers on the
- * next prompt exactly as before. An explicit `accept` (or a prompting default) rings.
+ * Can ringing wake a session under these Claude settings? Observed 2026-10-13: when
+ * the user default is bypassPermissions and crossSessionInbound is not set, every
+ * session holds the line (`peer_message_hold`, cause `no-mode-asserted`) and the
+ * desktop App cannot show the approval — ringing only leaves held notices. Then we
+ * do not ring, and the hook delivers on the next prompt. `accept` always rings,
+ * `refuse`/`hold` never do; otherwise it depends on the default mode.
  */
 export function doorbellUseful(settings: { crossSessionInbound?: unknown; permissions?: { defaultMode?: unknown } } | null): boolean {
-  if (settings?.crossSessionInbound === 'accept') return true;
-  if (settings?.crossSessionInbound === 'refuse' || settings?.crossSessionInbound === 'hold') return false;
-  return settings?.permissions?.defaultMode !== 'bypassPermissions';
+  switch (settings?.crossSessionInbound) {
+    case 'accept':
+      return true;
+    case 'refuse':
+    case 'hold':
+      return false;
+    default:
+      return settings?.permissions?.defaultMode !== 'bypassPermissions';
+  }
 }
 
 export interface DoorbellEvent {
@@ -174,44 +187,51 @@ export interface DoorbellOptions {
   inboxes: () => Map<string, InboxEntry>;
   ring?: (socketPath: string, frame: string) => Promise<{ ok: boolean; error?: string }>;
   onEvent?: (event: DoorbellEvent) => void;
-  /** Gate re-read each tick (cheap): false = don't ring, see doorbellUseful. */
+  /** Checked at every tick; returning false skips it (see doorbellUseful). */
   enabled?: () => boolean;
 }
 
 /**
- * Each tick: pending mail addressed to a running local Claude session gets ONE
- * ring per batch. A message is rung at most once (success or not) — the pull hook
- * is the safety net, so a dead socket must never turn into a ring storm.
+ * A ringing loop: each `tick()` rings every running local Claude session that has
+ * new pending mail, once for all of it. Each message is rung for at most once,
+ * whether the ring worked or not — the hook catches what a ring misses, and a
+ * broken socket must not be rung again and again.
  */
 export function createDoorbell(opts: DoorbellOptions): { tick(): Promise<void> } {
-  const ring = opts.ring ?? ringInbox;
-  const rung = new Set<string>();
-  return {
-    async tick() {
-      if (opts.enabled && !opts.enabled()) return;
-      const inboxes = opts.inboxes();
-      if (inboxes.size === 0) return;
-      const waiting = new Map<string, { ids: string[]; from: string }>();
-      for (const m of opts.mailbox.inbox({ pendingOnly: true })) {
-        // ADR-048: another person's message never rings a session
-        if (m.to.agent !== 'claude' || m.to.device || isPeerMessage(m) || rung.has(m.id) || !inboxes.has(m.to.sessionId)) continue;
-        const batch = waiting.get(m.to.sessionId) ?? { ids: [], from: `@${m.from.agent}:${m.from.sessionId.slice(0, 8)}` };
-        waiting.set(m.to.sessionId, { ...batch, ids: [...batch.ids, m.id] });
-      }
-      for (const [sessionId, { ids, from }] of waiting) {
-        const inbox = inboxes.get(sessionId);
-        if (!inbox) continue;
-        for (const id of ids) rung.add(id);
-        const r = await ring(inbox.socketPath, buildDoorbellFrame({ messageIds: ids, fromLabel: from }));
-        opts.onEvent?.(
-          r.ok
-            ? { kind: 'rung', sessionId, messageIds: ids }
-            : { kind: 'ring-failed', sessionId, messageIds: ids, detail: r.error ?? 'unknown error' },
-        );
-      }
-    },
-  };
+  const send = opts.ring ?? ringInbox;
+  const done = new Set<string>();
+
+  async function tick(): Promise<void> {
+    if (opts.enabled?.() === false) return;
+    const live = opts.inboxes();
+    if (live.size === 0) return;
+
+    // session id -> the new mail for it, and who sent the first of it
+    const batches = new Map<string, { ids: string[]; fromLabel: string }>();
+    for (const m of opts.mailbox.inbox({ pendingOnly: true })) {
+      const target = m.to;
+      const ringable = target.agent === 'claude' && !target.device && live.has(target.sessionId);
+      // ADR-048: mail from another person never rings anyone's session
+      if (!ringable || isPeerMessage(m) || done.has(m.id)) continue;
+      const batch = batches.get(target.sessionId);
+      if (batch) batch.ids.push(m.id);
+      else batches.set(target.sessionId, { ids: [m.id], fromLabel: `@${m.from.agent}:${m.from.sessionId.slice(0, 8)}` });
+    }
+
+    for (const [sessionId, batch] of batches) {
+      const inbox = live.get(sessionId);
+      if (!inbox) continue;
+      batch.ids.forEach((id) => done.add(id));
+      const outcome = await send(inbox.socketPath, buildDoorbellFrame({ messageIds: batch.ids, fromLabel: batch.fromLabel }));
+      const event: DoorbellEvent = outcome.ok
+        ? { kind: 'rung', sessionId, messageIds: batch.ids }
+        : { kind: 'ring-failed', sessionId, messageIds: batch.ids, detail: outcome.error ?? 'unknown error' };
+      opts.onEvent?.(event);
+    }
+  }
+
+  return { tick };
 }
 
-/** Shared registry instance for the daemon (liveness + doorbell). */
+/** The daemon's one registry, shared by the liveness check and the doorbell. */
 export const liveClaudeInboxes = createClaudeInboxRegistry();

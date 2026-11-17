@@ -3,24 +3,19 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { externalHeaderPath } from '../daemon/local-api.js';
 
-/**
- * 闪电说 (Shandianshuo) desktop integration — the first external agent (ADR-024).
- *
- * Its assistant runs on the DeepSeek-Harness SDK runtime inside a Tauri app.
- * Three source-verified constraints shape everything here:
- *
- *   1. The assistant shell inherits the App's minimal GUI PATH
- *      (/usr/bin:/bin:/usr/sbin:/sbin) and runs a non-interactive bash with
- *      $SHELL stripped — so `anyd` is not reachable and .zshrc is not read.
- *   2. Its sandbox is `workspace-write`: file writes outside the workspace need
- *      an approval prompt, but reads, network and process visibility are free.
- *      So we talk HTTP to the local daemon instead of writing ~/.morse.
- *   3. A user-dropped SKILL.md is DISABLED by default — the skill only loads if
- *      its key is set in skills-state.json.
- *
- * We write into the App's own data directory, so every change here is surgical:
- * the user's other skills, toggles and AGENTS.md content are never touched.
- */
+// Connecting 闪电说 (Shandianshuo), the first registered external agent (ADR-024).
+//
+// Its assistant runs inside a Tauri app (DeepSeek-Harness SDK runtime), which
+// decides how it can reach Morse:
+//   - its shell is a non-interactive bash with the app's bare GUI PATH
+//     (/usr/bin:/bin:/usr/sbin:/sbin) and no $SHELL: no `morse`/`anyd`, no .zshrc;
+//   - its sandbox is workspace-write: writing outside the workspace (e.g. ~/.morse)
+//     needs approval, but reading, networking and seeing processes do not — hence
+//     plain HTTP to the local daemon;
+//   - a skill folder dropped in by hand stays switched off until its key is set in
+//     skills-state.json.
+// So `morse connect sds` writes three things into the app's own data directory —
+// the skill, its switch, a block in AGENTS.md — and touches nothing else there.
 
 export interface SdsPaths {
   appHome: string;
@@ -34,282 +29,309 @@ export interface SdsPaths {
 export interface SdsChange {
   path: string;
   action: 'create' | 'update' | 'unchanged' | 'delete';
-  /** Full file content to write; absent for a delete. */
+  /** What the file will contain; not set for a delete. */
   content?: string;
-  /** One line explaining the change, for the dry-run printout. */
+  /** A one-line explanation shown in the preview. */
   note: string;
 }
 
-// Compatibility — identifiers, not branding (ADR-064): the skill dir name, the state key
-// and the block markers find what earlier installs wrote, so they keep the old name.
+// These keep the pre-Morse name on purpose (ADR-064): installs made by earlier
+// releases are found by them — the skill folder, its switch key, the block fences.
 const SKILL_NAME = 'anytoany';
-/** skills-state.json namespaces assistant skills under `voice_assistant/`. */
-const STATE_KEY = `voice_assistant/${SKILL_NAME}`;
-const BEGIN = '<!-- anytoany:begin -->';
-const END = '<!-- anytoany:end -->';
+const STATE_KEY = 'voice_assistant/' + SKILL_NAME; // the app files assistant skills under voice_assistant/
+const FENCE_OPEN = '<!-- anytoany:begin -->';
+const FENCE_CLOSE = '<!-- anytoany:end -->';
 
-const DEFAULT_PORT = 7433;
+const DAEMON_PORT = 7433;
 
-/** `~/Library/Application Support/Shandianshuo` (identifier cn.shandianshuo.desktop). */
+/** The external agent name 闪电说 registers and sends as; its local-API token (ADR-087) is stored under it. */
+export const SDS_AGENT = 'sds';
+
+/** Where the app keeps its data on macOS (bundle id cn.shandianshuo.desktop). */
 export function defaultAppHome(home: string = homedir()): string {
   return join(home, 'Library', 'Application Support', 'Shandianshuo');
 }
 
-export function resolveSdsPaths(opts: { appHome?: string; home?: string } = {}): SdsPaths {
-  const appHome = opts.appHome ?? defaultAppHome(opts.home);
-  const workspace = readWorkspaceOverride(appHome) ?? join(appHome, 'workspace');
-  const skillDir = join(workspace, 'library', 'skills', SKILL_NAME);
-  return {
-    appHome,
-    workspace,
-    skillDir,
-    skillFile: join(skillDir, 'SKILL.md'),
-    stateFile: join(appHome, 'skills', 'skills-state.json'),
-    agentsFile: join(workspace, 'AGENTS.md'),
-  };
-}
-
-/** The user can relocate the workspace — never hardcode its path. */
-function readWorkspaceOverride(appHome: string): string | null {
+/** The workspace the user moved it to, if the app's migration marker says so. */
+function movedWorkspace(appHome: string): string | null {
+  let marker: { workspacePath?: unknown };
   try {
-    const raw = readFileSync(join(appHome, 'migrations', 'workspace-location-v1.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { workspacePath?: unknown };
-    return typeof parsed.workspacePath === 'string' && parsed.workspacePath ? parsed.workspacePath : null;
+    marker = JSON.parse(readFileSync(join(appHome, 'migrations', 'workspace-location-v1.json'), 'utf8')) as typeof marker;
   } catch {
     return null;
   }
+  const moved = marker?.workspacePath;
+  return typeof moved === 'string' && moved !== '' ? moved : null;
 }
 
-/** Insert or replace our fenced block, leaving everything else byte-identical. */
+export function resolveSdsPaths(opts: { appHome?: string; home?: string } = {}): SdsPaths {
+  const appHome = opts.appHome ?? defaultAppHome(opts.home);
+  const workspace = movedWorkspace(appHome) ?? join(appHome, 'workspace');
+  const skillDir = join(workspace, 'library', 'skills', SKILL_NAME);
+  const skillFile = join(skillDir, 'SKILL.md');
+  const stateFile = join(appHome, 'skills', 'skills-state.json'); // the app's own switch file, outside the workspace
+  const agentsFile = join(workspace, 'AGENTS.md');
+  return { appHome, workspace, skillDir, skillFile, stateFile, agentsFile };
+}
+
+/** Where our fenced block sits in `doc`: [index of the opening fence, index just past the closing one]. */
+function fencedSpan(doc: string): [number, number] | null {
+  const open = doc.indexOf(FENCE_OPEN);
+  const close = doc.indexOf(FENCE_CLOSE);
+  if (open < 0 || close < 0 || close < open) return null;
+  return [open, close + FENCE_CLOSE.length];
+}
+
+/** Put `body` in our fenced block: replace the block if `existing` has one, else add it at the end. Nothing outside it changes. */
 export function upsertMarkedBlock(existing: string, body: string): string {
-  const block = `${BEGIN}\n${body}\n${END}`;
-  const start = existing.indexOf(BEGIN);
-  const end = existing.indexOf(END);
-  if (start !== -1 && end !== -1 && end > start) {
-    return existing.slice(0, start) + block + existing.slice(end + END.length);
-  }
-  const prefix = existing.length === 0 || existing.endsWith('\n') ? existing : `${existing}\n`;
-  return `${prefix}${prefix.length > 0 ? '\n' : ''}${block}\n`;
+  const block = [FENCE_OPEN, body, FENCE_CLOSE].join('\n');
+  const span = fencedSpan(existing);
+  if (span) return existing.slice(0, span[0]) + block + existing.slice(span[1]);
+  if (existing === '') return block + '\n';
+  // keep the user's text as it is, end it with a newline, then one blank line before ours
+  const separator = existing.endsWith('\n') ? '\n' : '\n\n';
+  return existing + separator + block + '\n';
 }
 
-/** Remove our fenced block; a document without one is returned unchanged. */
+/** Take our fenced block out of `existing`; without one the text comes back as it was. */
 export function removeMarkedBlock(existing: string): string {
-  const start = existing.indexOf(BEGIN);
-  const end = existing.indexOf(END);
-  if (start === -1 || end === -1 || end < start) return existing;
-  const cleaned = existing.slice(0, start).replace(/\n+$/, '\n') + existing.slice(end + END.length).replace(/^\n+/, '');
-  return cleaned;
+  const span = fencedSpan(existing);
+  if (!span) return existing;
+  const before = existing.slice(0, span[0]).replace(/\n+$/, '\n');
+  const after = existing.slice(span[1]).replace(/^\n+/, '');
+  return before + after;
 }
 
-/** The external agent name 闪电说 registers and sends as — its token (ADR-087) is kept under this name. */
-export const SDS_AGENT = 'sds';
+// ---- the text the assistant reads -------------------------------------------------
+
+/** Its session id, as the app hands it to the shell. */
+const SESSION_LINE = 'SID="${DSH_SESSION_ID:-${SHANDIANSHUO_DSH_SESSION_ID:-main}}"';
 
 /**
- * ADR-087: the header every call to the local API carries — the app's own token. curl reads it from a file
- * only the user can read (`-H @<file>`: the assistant's sandbox may read files; it cannot write ~/.morse), so
- * the token is neither in these instructions nor on a command line (follow-up 2: `$(cat …)` put it where
- * `ps` shows it).
+ * The token header as a curl argument (ADR-087): `-H @<file>` makes curl read it from
+ * a file only the user can read. The assistant may read files but not write ~/.morse,
+ * and this way the token is in neither these instructions nor any command line
+ * (`$(cat …)`, used once, put it where `ps` shows it). Quoted as one shell word.
  */
-const tokenHeader = (headerFile: string): string => `-H @'${headerFile.replace(/'/g, `'\\''`)}'`;
+const tokenHeader = (headerFile: string): string => `-H @'${headerFile.split("'").join(`'\\''`)}'`;
 
-export function sdsSkillMarkdown(port: number = DEFAULT_PORT, tokenFile: string = externalHeaderPath(SDS_AGENT)): string {
-  const auth = tokenHeader(tokenFile);
-  return `---
-name: ${SKILL_NAME}
-description: 跟这台电脑上其他 AI agent 会话互发消息（Claude Code、Codex、Kimi、Z Code）。当用户要「让 Claude Code / Codex 去做某事」「问问某个会话」「有没有新消息 / 回信」「看看 XX 项目那边怎么样了」时使用。
----
+/** A JSON body as one double-quoted shell word, so `$SID` inside it still expands. */
+const shellJson = (value: unknown): string => `"${JSON.stringify(value).replace(/"/g, '\\"')}"`;
 
-# Morse —— 调用这台电脑上的其他 AI agent
+const sessionRef = { agent: SDS_AGENT, sessionId: '$SID' };
+const inboxBody = shellJson({ ...sessionRef, register: true, title: '闪电说助手' });
+const sendBody = shellJson({ target: '@codex:sunoprompt', from: sessionRef, text: '请把登录页的报错修掉，改完回我' });
 
-你是用户的总驾驶舱。用户跟你说话，你把活派给专门的 agent 会话（Claude Code、Codex 等），再把回信念给用户。
+/** A curl command; each extra part goes on its own continuation line. */
+const curl = (first: string, ...more: string[]): string => [`curl -s ${first}`, ...more].join(' \\\n  ');
 
-全部通过本机 daemon 的 HTTP 接口完成。**不要尝试运行 \`anyd\` 命令**——它不在你的 PATH 里，而且沙箱会拦住它写数据库。\`curl\` 一定可用。
+const bash = (...lines: string[]): string => ['```bash', ...lines, '```'].join('\n');
 
-## 你的身份
-
-\`\`\`bash
-SID="\${DSH_SESSION_ID:-\${SHANDIANSHUO_DSH_SESSION_ID:-main}}"
-\`\`\`
-
-## 1. 收信（每轮对话开始时做一次）
-
-\`\`\`bash
-SID="\${DSH_SESSION_ID:-\${SHANDIANSHUO_DSH_SESSION_ID:-main}}"
-curl -s -m 10 -X POST http://127.0.0.1:${port}/api/inbox \\
-  ${auth} \\
-  -H 'content-type: application/json' \\
-  -d "{\\"agent\\":\\"sds\\",\\"sessionId\\":\\"\$SID\\",\\"register\\":true,\\"title\\":\\"闪电说助手\\"}"
-\`\`\`
-
-返回 \`{"count":N,"text":"...","messages":[...]}\`。\`count\` 为 0 就什么都不用说；大于 0 就把 \`text\` 的内容**如实转述给用户**（谁发来的、说了什么），不要编造没有的内容。
-
-\`register:true\` 会顺带把你注册成可寻址的 \`@sds\`，别人才回得了信——每次都带上，它是幂等的。
-
-## 2. 查有哪些 agent 会话可以派活
-
-\`\`\`bash
-curl -s -m 20 ${auth} "http://127.0.0.1:${port}/api/sessions?q=项目关键词&limit=10"
-\`\`\`
-
-\`q\` 按会话标题或项目文件夹名查；不带 \`limit\` 最多返回 50 条。返回里每条有 \`agent\`、\`title\`，寻址写成 \`@<agent>:<title 的一部分>\`，例如 \`@codex:sunoprompt\`。
-
-## 3. 发信（派活 / 提问）
-
-\`\`\`bash
-SID="\${DSH_SESSION_ID:-\${SHANDIANSHUO_DSH_SESSION_ID:-main}}"
-curl -s -m 30 -X POST http://127.0.0.1:${port}/api/send \\
-  ${auth} \\
-  -H 'content-type: application/json' \\
-  -d "{\\"target\\":\\"@codex:sunoprompt\\",\\"from\\":{\\"agent\\":\\"sds\\",\\"sessionId\\":\\"\$SID\\"},\\"text\\":\\"请把登录页的报错修掉，改完回我\\"}"
-\`\`\`
-
-- 成功返回 201。返回 422 表示目标没找到，先用第 2 步查一下真实的 \`title\` 再重发。
-- \`from\` 必须是你自己，回信才找得回来。
-- 消息内容要**自带完整上下文**——对方看不到你和用户的对话。
-
-## 重要事实
-
-- **对方不是立刻回**：它要花时间干活。发完就告诉用户「已经派过去了」，等下一轮再收信，别原地空等。
-- **你自己不会自动醒**：收信只发生在用户跟你说话的时候。有新消息时系统会弹 macOS 通知提醒用户来问你。
-- daemon 没开的话 curl 会连不上，这时如实告诉用户「Morse 服务没在跑」，不要假装发出去了。
-- 每条 curl 都要带上面那个 \`-H @'…'\`（curl 从本机一个只有用户能读的文件里读出口令头，不要把文件内容打印出来），\`content-type\` 也必须是 \`application/json\`。返回 401 表示口令不对或文件不在：如实告诉用户「请在终端运行 morse connect sds --apply 重新接入」，不要重试。你只能以 \`sds\` 的身份、用你自己的会话收信和发信，不能带附件。
-`;
+interface Wiring {
+  url: (endpoint: string) => string;
+  auth: string;
 }
 
-function sdsAgentsBlock(port: number = DEFAULT_PORT, tokenFile: string = externalHeaderPath(SDS_AGENT)): string {
-  const auth = tokenHeader(tokenFile);
-  return `## Morse —— 跨 agent 消息（由 \`anyd connect sds\` 写入，可用 \`anyd connect sds --uninstall\` 移除）
+const wiring = (port: number, tokenFile: string): Wiring => ({
+  url: (endpoint) => `http://127.0.0.1:${port}/api/${endpoint}`,
+  auth: tokenHeader(tokenFile),
+});
 
-每轮对话开始时，先静默执行一次收信（有新消息才告诉用户，没有就当无事发生）：
+const JSON_TYPE = "-H 'content-type: application/json'";
 
-\`\`\`bash
-SID="\${DSH_SESSION_ID:-\${SHANDIANSHUO_DSH_SESSION_ID:-main}}"
-curl -s -m 10 -X POST http://127.0.0.1:${port}/api/inbox ${auth} -H 'content-type: application/json' \\
-  -d "{\\"agent\\":\\"sds\\",\\"sessionId\\":\\"\$SID\\",\\"register\\":true,\\"title\\":\\"闪电说助手\\"}"
-\`\`\`
-
-用户要「让 Claude Code / Codex 去做某事」或问「那边怎么样了」时，加载 \`${SKILL_NAME}\` 技能按它的说明操作。不要运行 \`anyd\` 命令（不在 PATH 里，且沙箱会拦）。`;
+export function sdsSkillMarkdown(port: number = DAEMON_PORT, tokenFile: string = externalHeaderPath(SDS_AGENT)): string {
+  const { url, auth } = wiring(port, tokenFile);
+  const sections = [
+    [
+      '---',
+      `name: ${SKILL_NAME}`,
+      'description: 给这台电脑上的其他 AI agent 会话（Claude Code、Codex、Kimi、Z Code）派活、提问、收回信。用户说「让 Claude Code／Codex 去做…」「问一下某个会话」「有新消息／回信吗」「XX 项目那边进展如何」时使用。',
+      '---',
+    ].join('\n'),
+    [
+      '# Morse：和本机其他 AI agent 通信',
+      '',
+      '用户只跟你说话；真正干活的是专门的 agent 会话（Claude Code、Codex 等）。你负责把活派过去，再把它们的回信讲给用户听。',
+      '',
+      '所有操作都是对本机 Morse 服务发 HTTP 请求，用 `curl`（一定装着）。**别去运行 `anyd` 或 `morse` 命令**：它们不在你的 PATH 里，沙箱也不让它们写数据。',
+    ].join('\n'),
+    ['## 你是谁', '', '你的会话号这样取；收信、发信的命令都以这一行开头：', '', bash(SESSION_LINE)].join('\n'),
+    [
+      '## 一、收信（每轮对话一开始做一次）',
+      '',
+      bash(SESSION_LINE, curl(`-m 10 -X POST ${url('inbox')}`, auth, JSON_TYPE, `-d ${inboxBody}`)),
+      '',
+      '会返回 `{"count":N,"text":"...","messages":[...]}`。`count` 是 0 就不用提；不是 0 就把 `text` 里的内容**原样讲给用户**（谁发的、说了什么），没有的内容不要编。',
+      '',
+      '`register:true` 顺便把你登记成 `@sds`，这样别人才能回信给你。每次都带上，重复登记没有副作用。',
+    ].join('\n'),
+    [
+      '## 二、看看能找谁',
+      '',
+      bash(curl(`-m 20 ${auth} "${url('sessions')}?q=项目关键词&limit=10"`)),
+      '',
+      '`q` 匹配会话标题或项目文件夹名；不写 `limit` 时最多给 50 条。每条结果有 `agent` 和 `title`，发信时写 `@<agent>:<title 里的一段>`，比如 `@codex:sunoprompt`。',
+    ].join('\n'),
+    [
+      '## 三、发信（派活或提问）',
+      '',
+      bash(SESSION_LINE, curl(`-m 30 -X POST ${url('send')}`, auth, JSON_TYPE, `-d ${sendBody}`)),
+      '',
+      '- 返回 201 就是发出去了。返回 422 是没找到这个目标：先用第二步查到真实的 `title`，再发一次。',
+      '- `from` 必须写你自己，回信才能回到你这里。',
+      '- 对方看不到你和用户聊了什么，所以消息里要**把来龙去脉写全**。',
+    ].join('\n'),
+    [
+      '## 要记住的',
+      '',
+      '- **回信不会马上来**：对方要花时间干活。发完告诉用户「已经交给它了」，下一轮再收信，不要原地等。',
+      '- **你不会自己醒来**：只有用户跟你说话时你才会去收信。新消息到了，系统会弹一条 macOS 通知，提醒用户来问你。',
+      '- curl 连不上，说明 Morse 服务没在运行：就照实告诉用户「Morse 服务没在跑」，别说已经发出去了。',
+      "- 每条 curl 都要带上面那个 `-H @'…'`：curl 会从本机一个只有用户能读的文件里取出口令头，文件内容不要打印出来。`content-type` 也必须是 `application/json`。返回 401 说明口令不对或那个文件不在了：照实告诉用户「请在终端运行 morse connect sds --apply 重新接入」，不要重试。你只能用 `sds` 这个身份、用自己的会话收信和发信，不能带附件。",
+    ].join('\n'),
+  ];
+  return sections.join('\n\n') + '\n';
 }
+
+/** The standing instruction kept in the app's AGENTS.md, between our fences. */
+function sdsAgentsBlock(port: number = DAEMON_PORT, tokenFile: string = externalHeaderPath(SDS_AGENT)): string {
+  const { url, auth } = wiring(port, tokenFile);
+  return [
+    '## Morse：跨 agent 消息（由 `anyd connect sds` 写入，`anyd connect sds --uninstall` 可移除）',
+    '',
+    '每轮对话开始先悄悄收一次信；有新消息再告诉用户，没有就什么都不说：',
+    '',
+    bash(SESSION_LINE, curl(`-m 10 -X POST ${url('inbox')} ${auth} ${JSON_TYPE}`, `-d ${inboxBody}`)),
+    '',
+    `用户要「让 Claude Code／Codex 去做某事」或者问「那边怎么样了」时，加载 \`${SKILL_NAME}\` 技能，照它说的做。别运行 \`anyd\` 命令：它不在 PATH 里，沙箱也会拦住。`,
+  ].join('\n');
+}
+
+// ---- reading what is there, planning, writing ------------------------------------
 
 interface StateEntry {
   enabled: boolean;
   created_at: number;
 }
 
-function readState(stateFile: string): Record<string, StateEntry> {
-  try {
-    const parsed = JSON.parse(readFileSync(stateFile, 'utf8')) as unknown;
-    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, StateEntry>) : {};
-  } catch {
-    return {};
-  }
-}
+type SkillState = Record<string, StateEntry>;
 
-const readOr = (path: string, fallback = ''): string => {
+/** A file's text, or `fallback` when it cannot be read. */
+function textOf(path: string, fallback = ''): string {
   try {
     return readFileSync(path, 'utf8');
   } catch {
     return fallback;
   }
-};
+}
 
-const change = (path: string, content: string, note: string): SdsChange => {
-  const existed = existsSync(path);
-  const action = !existed ? 'create' : readOr(path) === content ? 'unchanged' : 'update';
+/** The app's skill switches; an absent or broken file means none are set. */
+function skillState(stateFile: string): SkillState {
+  try {
+    const value: unknown = JSON.parse(readFileSync(stateFile, 'utf8'));
+    return value !== null && typeof value === 'object' ? (value as SkillState) : {};
+  } catch {
+    return {};
+  }
+}
+
+const stateText = (state: SkillState): string => JSON.stringify(state, null, 2) + '\n';
+
+/** A planned write of `content` to `path`, marked create / update / unchanged against what is there now. */
+function plannedWrite(path: string, content: string, note: string): SdsChange {
+  let action: SdsChange['action'];
+  if (!existsSync(path)) action = 'create';
+  else action = textOf(path) === content ? 'unchanged' : 'update';
   return { path, action, content, note };
-};
+}
 
 export interface SdsDetection {
   appInstalled: boolean;
   skillInstalled: boolean;
-  /** The file being present is not enough — DSH only loads a skill whose toggle is on. */
+  /** Whether its switch is on — the app ignores a skill whose switch is off, file or not. */
   skillEnabled: boolean;
 }
 
-/** Is 闪电说 here, and is it already wired up? Drives `anyd setup`'s hint and `morse status --check`. */
+/** Is 闪电说 on this machine, and is our skill there and switched on? (`morse setup`, `morse status --check`.) */
 export function detectSds(paths: SdsPaths): SdsDetection {
-  const appInstalled = existsSync(paths.appHome);
-  const skillInstalled = appInstalled && existsSync(paths.skillFile);
-  return {
-    appInstalled,
-    skillInstalled,
-    skillEnabled: skillInstalled && readState(paths.stateFile)[STATE_KEY]?.enabled === true,
-  };
+  if (!existsSync(paths.appHome)) return { appInstalled: false, skillInstalled: false, skillEnabled: false };
+  if (!existsSync(paths.skillFile)) return { appInstalled: true, skillInstalled: false, skillEnabled: false };
+  return { appInstalled: true, skillInstalled: true, skillEnabled: skillState(paths.stateFile)[STATE_KEY]?.enabled === true };
 }
 
-/** Compute the three writes without touching disk. */
-export function planSdsInstall(paths: SdsPaths, opts: { port?: number; now?: () => number; /** the file curl reads the app's token header from (ADR-087); default: this home's */ tokenFile?: string } = {}): SdsChange[] {
+/** The writes an install makes — skill, switch, AGENTS.md block, in that order — worked out without writing anything. */
+export function planSdsInstall(
+  paths: SdsPaths,
+  opts: {
+    port?: number;
+    now?: () => number;
+    /** The file curl takes the token header from (ADR-087); defaults to this home's. */
+    tokenFile?: string;
+  } = {},
+): SdsChange[] {
   if (!existsSync(paths.appHome)) {
     throw new Error(`闪电说 not found at ${paths.appHome} — install the app first, or pass --app-home`);
   }
-  const port = opts.port ?? DEFAULT_PORT;
-  const now = opts.now ?? Date.now;
+  const port = opts.port ?? DAEMON_PORT;
   const tokenFile = opts.tokenFile ?? externalHeaderPath(SDS_AGENT);
 
-  const state = readState(paths.stateFile);
-  const nextState: Record<string, StateEntry> = {
-    ...state,
-    [STATE_KEY]: { enabled: true, created_at: state[STATE_KEY]?.created_at ?? Math.floor(now() / 1000) },
+  const state = skillState(paths.stateFile);
+  // keep the date of the first install; a new switch is stamped in seconds, as the app does
+  const createdAt = state[STATE_KEY]?.created_at ?? Math.floor((opts.now ?? Date.now)() / 1000);
+  const switchedOn: SkillState = { ...state, [STATE_KEY]: { enabled: true, created_at: createdAt } };
+
+  const skill = plannedWrite(paths.skillFile, sdsSkillMarkdown(port, tokenFile), `技能本身（文件夹名 ${SKILL_NAME} 就是技能名）`);
+  const toggle = plannedWrite(paths.stateFile, stateText(switchedOn), `打开技能开关 "${STATE_KEY}"（手动放进去的技能默认关着），别的开关不动`);
+  const agents = plannedWrite(
+    paths.agentsFile,
+    upsertMarkedBlock(textOf(paths.agentsFile), sdsAgentsBlock(port, tokenFile)),
+    '加上常驻指令块（块外的内容不动）',
+  );
+  return [skill, toggle, agents];
+}
+
+/** Undo exactly what an install wrote, worked out without writing anything. */
+export function planSdsUninstall(paths: SdsPaths): SdsChange[] {
+  const skill: SdsChange = {
+    path: paths.skillFile,
+    action: existsSync(paths.skillFile) ? 'delete' : 'unchanged',
+    note: '删掉技能文件夹',
   };
 
-  return [
-    change(paths.skillFile, sdsSkillMarkdown(port, tokenFile), `技能正文（目录名 ${SKILL_NAME} 即技能名）`),
-    change(
-      paths.stateFile,
-      `${JSON.stringify(nextState, null, 2)}\n`,
-      `开启技能开关 "${STATE_KEY}"（手动放入的技能默认是禁用的），其余键原样保留`,
-    ),
-    change(
-      paths.agentsFile,
-      upsertMarkedBlock(readOr(paths.agentsFile), sdsAgentsBlock(port, tokenFile)),
-      '追加常驻指令块（块外内容原样保留）',
-    ),
-  ];
+  const { [STATE_KEY]: ours, ...others } = skillState(paths.stateFile);
+  const toggle: SdsChange =
+    ours !== undefined
+      ? { path: paths.stateFile, action: 'update', content: stateText(others), note: `去掉 "${STATE_KEY}"，别的开关不动` }
+      : { path: paths.stateFile, action: 'unchanged', note: '开关文件里没有我们的键' };
+
+  const current = textOf(paths.agentsFile);
+  const cleaned = removeMarkedBlock(current);
+  const agents: SdsChange =
+    cleaned !== current
+      ? { path: paths.agentsFile, action: 'update', content: cleaned, note: '去掉常驻指令块' }
+      : { path: paths.agentsFile, action: 'unchanged', note: 'AGENTS.md 里没有我们的块' };
+
+  return [skill, toggle, agents];
 }
 
-/** Compute the removal of exactly what we installed. */
-export function planSdsUninstall(paths: SdsPaths): SdsChange[] {
-  const state = readState(paths.stateFile);
-  const { [STATE_KEY]: ours, ...rest } = state;
-
-  const agentsBefore = readOr(paths.agentsFile);
-  const agentsAfter = removeMarkedBlock(agentsBefore);
-
-  return [
-    {
-      path: paths.skillFile,
-      action: existsSync(paths.skillFile) ? 'delete' : 'unchanged',
-      note: '删除技能目录',
-    },
-    ours === undefined
-      ? { path: paths.stateFile, action: 'unchanged', note: '技能开关本来就没有我们的键' }
-      : {
-          path: paths.stateFile,
-          action: 'update',
-          content: `${JSON.stringify(rest, null, 2)}\n`,
-          note: `移除 "${STATE_KEY}"，其余键原样保留`,
-        },
-    agentsBefore === agentsAfter
-      ? { path: paths.agentsFile, action: 'unchanged', note: 'AGENTS.md 里没有我们的块' }
-      : { path: paths.agentsFile, action: 'update', content: agentsAfter, note: '移除常驻指令块' },
-  ];
-}
-
-/** Perform a plan. `unchanged` entries are skipped, so this is safe to re-run. */
+/** Carry out a plan. Unchanged entries are skipped, so running it twice is harmless. A delete removes the file's whole folder. */
 export function applyChanges(changes: SdsChange[]): void {
-  for (const c of changes) {
-    if (c.action === 'unchanged') continue;
-    if (c.action === 'delete') {
-      rmSync(dirname(c.path), { recursive: true, force: true });
-      continue;
+  for (const { path, action, content } of changes) {
+    switch (action) {
+      case 'unchanged':
+        break;
+      case 'delete':
+        rmSync(dirname(path), { recursive: true, force: true });
+        break;
+      default:
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content ?? '', 'utf8');
     }
-    mkdirSync(dirname(c.path), { recursive: true });
-    writeFileSync(c.path, c.content ?? '', 'utf8');
   }
 }
 
-/** The daemon port an installed skill was written for — null when there is none (or it cannot be told). */
+/** The daemon port the installed skill talks to, or null without a skill (or a port in it). */
 export function installedSdsPort(paths: SdsPaths): number | null {
-  const m = /127\.0\.0\.1:(\d+)\/api\/inbox/.exec(readOr(paths.skillFile));
-  return m ? Number(m[1]) : null;
+  const found = textOf(paths.skillFile).match(/127\.0\.0\.1:(\d+)\/api\/inbox/);
+  return found ? Number(found[1]) : null;
 }

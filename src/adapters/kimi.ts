@@ -1,124 +1,86 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, delimiter, join } from 'node:path';
+import { basename, join } from 'node:path';
+import { DEFAULT_TURN_MS, TITLE_LIMIT, locateCli, objectLines, runOptions, stringField, tailOf } from './common.js';
 import { realExec } from './exec.js';
 import type { DeliveryAdapter, DeliveryResult, ExecFn, SessionInfo } from './types.js';
 
-const TITLE_MAX = 80;
-/** Kimi Code ships a single self-contained binary here after install. */
-const HOME_BIN = join(homedir(), '.kimi-code', 'bin', 'kimi');
-
-interface KimiAdapterOptions {
+interface KimiSetup {
   indexFile?: string;
   kimiBin?: string;
   exec?: ExecFn;
   deliverTimeoutMs?: number;
 }
 
-interface IndexRow {
-  sessionId?: unknown;
-  workDir?: unknown;
-  sessionDir?: unknown;
-}
-
-function defaultIndexFile(): string {
-  return join(homedir(), '.kimi-code', 'session_index.jsonl');
-}
-
-function resolveKimi(): string | null {
-  // MORSE_KIMI_BIN; compatibility: the old name ANYTOANY_KIMI_BIN is still read (ADR-075)
-  const env = process.env.MORSE_KIMI_BIN || process.env.ANYTOANY_KIMI_BIN;
-  if (env && existsSync(env)) return env;
-  for (const d of (process.env.PATH ?? '').split(delimiter)) {
-    if (d && existsSync(join(d, 'kimi'))) return join(d, 'kimi');
-  }
-  if (existsSync(HOME_BIN)) return HOME_BIN;
-  return null;
-}
+/** The Kimi Code binary: MORSE_KIMI_BIN (or its old name ANYTOANY_KIMI_BIN, ADR-075), PATH, then where its installer puts it. */
+const findKimi = (): string | null =>
+  locateCli({
+    envNames: ['MORSE_KIMI_BIN', 'ANYTOANY_KIMI_BIN'],
+    command: 'kimi',
+    installed: () => join(homedir(), '.kimi-code', 'bin', 'kimi'),
+  });
 
 /**
- * Pull the agent's reply out of kimi's --output-format stream-json. Each line is
- * a JSON message; only assistant `content` is the agent's prose (which carries
- * the Morse reply marker). `tool` results and the trailing `meta`
- * session.resume_hint must be excluded or they pollute reply extraction.
+ * The agent's own words in a `--output-format stream-json` run. Each line is one message;
+ * only assistant messages with text content count — tool results and the closing `meta`
+ * resume hint would otherwise end up in the reply the marker is read from.
  */
-function assistantText(stdout: string): string {
-  const parts: string[] = [];
-  for (const line of stdout.split('\n')) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const msg = JSON.parse(t) as { role?: string; content?: unknown };
-      if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content) {
-        parts.push(msg.content);
-      }
-    } catch {
-      // non-JSON noise (banners) — ignore
-    }
-  }
-  return parts.join('\n');
+function assistantProse(stdout: string): string {
+  return objectLines<{ role?: unknown; content?: unknown }>(stdout)
+    .filter((m) => m.role === 'assistant')
+    .map((m) => (typeof m.content === 'string' ? m.content : ''))
+    .filter((text) => text !== '')
+    .join('\n');
 }
 
-export function createKimiAdapter(options: KimiAdapterOptions = {}): DeliveryAdapter {
-  const indexFile = options.indexFile ?? defaultIndexFile();
-  const exec = options.exec ?? realExec;
-  const timeoutMs = options.deliverTimeoutMs ?? 300_000;
+/** One row of ~/.kimi-code/session_index.jsonl turned into a session (null: no usable id). */
+async function sessionFromRow(row: object): Promise<SessionInfo | null> {
+  const sessionId = stringField(row, 'sessionId');
+  if (!sessionId) return null;
+  const cwd = stringField(row, 'workDir') ?? '';
+  const dir = stringField(row, 'sessionDir');
+  // the session folder is touched on every turn; a folder that is gone counts as never used
+  const lastActiveAt = dir === undefined ? 0 : await stat(dir).then((s) => s.mtimeMs, () => 0);
+  // kimi titles are the folder name, cut without an ellipsis
+  const title = (basename(cwd) || 'untitled').slice(0, TITLE_LIMIT);
+  return { agent: 'kimi', sessionId, title, cwd, lastActiveAt };
+}
+
+export function createKimiAdapter(setup: KimiSetup = {}): DeliveryAdapter {
+  const indexFile = setup.indexFile ?? join(homedir(), '.kimi-code', 'session_index.jsonl');
+  const exec = setup.exec ?? realExec;
+  const turnMs = setup.deliverTimeoutMs ?? DEFAULT_TURN_MS;
 
   return {
     agent: 'kimi',
 
-    // Verified on kimi 0.32.0: `kimi -S <id> -p <text>` resumes headless and
-    // carries full history. `-p` CANNOT combine with -y/--yolo/--auto/--plan
-    // (the CLI rejects it), and default -p already executes tools — so no
-    // escalation flag is needed or possible here.
+    // `kimi -S <id> -p <text>` resumes the session headless with its history (checked on
+    // 0.32.0). With -p the CLI already runs tools and refuses -y/--yolo/--auto/--plan, so
+    // there is no permission flag to add — and none is ever added.
     async deliver(session: SessionInfo, envelope: string): Promise<DeliveryResult> {
-      const bin = options.kimiBin ?? resolveKimi();
-      if (!bin) {
-        return { ok: false, error: 'kimi not found — install Kimi Code or set MORSE_KIMI_BIN' };
-      }
-      const args = ['-S', session.sessionId, '-p', envelope, '--output-format', 'stream-json'];
-      const { stdout, stderr, code } = await exec(
-        bin,
-        args,
-        session.cwd ? { cwd: session.cwd, timeoutMs } : { timeoutMs },
-      );
-      if (code !== 0) {
-        return { ok: false, error: `kimi resume exited ${code}: …${stderr.slice(-500)}` };
-      }
-      return { ok: true, output: assistantText(stdout) };
+      const bin = setup.kimiBin ?? findKimi();
+      if (!bin) return { ok: false, error: 'kimi not found — install Kimi Code or set MORSE_KIMI_BIN' };
+      const argv = ['-S', session.sessionId, '-p', envelope, '--output-format', 'stream-json'];
+      const run = await exec(bin, argv, runOptions(session.cwd, turnMs));
+      if (run.code !== 0) return { ok: false, error: `kimi resume exited ${run.code}: …${tailOf(run.stderr)}` };
+      return { ok: true, output: assistantProse(run.stdout) };
     },
 
     async listSessions(): Promise<SessionInfo[]> {
-      let raw: string;
+      let text: string;
       try {
-        raw = readFileSync(indexFile, 'utf8');
+        text = readFileSync(indexFile, 'utf8');
       } catch {
-        return []; // kimi not installed / no sessions yet
+        return []; // no Kimi Code here, or no session yet
       }
-      const byId = new Map<string, SessionInfo>();
-      for (const line of raw.split('\n')) {
-        if (!line.trim()) continue;
-        let row: IndexRow;
-        try {
-          row = JSON.parse(line) as IndexRow;
-        } catch {
-          continue; // skip malformed index lines
-        }
-        if (typeof row.sessionId !== 'string' || !row.sessionId) continue;
-        const cwd = typeof row.workDir === 'string' ? row.workDir : '';
-        const title = (basename(cwd) || 'untitled').slice(0, TITLE_MAX);
-        let mtimeMs = 0;
-        if (typeof row.sessionDir === 'string') {
-          try {
-            mtimeMs = (await stat(row.sessionDir)).mtimeMs;
-          } catch {
-            /* dir gone — keep 0 */
-          }
-        }
-        byId.set(row.sessionId, { agent: 'kimi', sessionId: row.sessionId, title, cwd, lastActiveAt: mtimeMs });
+      // the index is appended to: for an id listed twice the later row describes it
+      const latest = new Map<string, SessionInfo>();
+      for (const row of objectLines<object>(text)) {
+        const session = await sessionFromRow(row);
+        if (session) latest.set(session.sessionId, session);
       }
-      return [...byId.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+      return [...latest.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt);
     },
   };
 }

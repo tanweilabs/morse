@@ -1,31 +1,25 @@
-import { listRegistered } from '../registry/external.js';
+import { listRegistered, type ExternalSession } from '../registry/external.js';
 import type { AgentAdapter, SessionInfo } from './types.js';
 
+/** A registration as the session directory sees it: its last check-in is its last activity. */
+const toSessionInfo = ({ agent, sessionId, title, cwd, lastSeenAt }: ExternalSession): SessionInfo => ({
+  agent,
+  sessionId,
+  title,
+  cwd,
+  lastActiveAt: lastSeenAt,
+});
+
 /**
- * Directory adapter for external agents (ADR-024).
+ * Lists registered external agents (ADR-024) next to the CLI agents, so `@sds:…`
+ * resolves and `morse list` shows them.
  *
- * Surfaces every registered session (`~/.morse/registered/`) so a GUI/App
- * agent such as 闪电说 (`sds`) becomes an addressable target: `@sds:…` resolves,
- * `anyd list` shows it, and replies have somewhere to go.
- *
- * Deliberately a plain `AgentAdapter` with NO `deliver`: these sessions are
- * pull-only. The dispatcher skips them (`isPullOnly`) and they must never end
- * up in its `Map<string, DeliveryAdapter>` — see `directoryAdapters()` in cli.ts.
+ * It only lists. There is no `deliver`: a registered session pulls its own mail,
+ * and the dispatcher must never get a delivery adapter for it (cli.ts keeps this
+ * adapter out of that map). The `agent` label here only names the source when a
+ * scan fails — each listed session carries the name it registered under.
  */
-export function createRegisteredAdapter(
-  opts: { home?: string; now?: () => number } = {},
-): AgentAdapter {
-  return {
-    // Only used to attribute a scan failure in `listAllSessions`; addressing uses
-    // each session's own `agent` field, which is whatever the app registered as.
-    agent: 'external',
-    listSessions: async (): Promise<SessionInfo[]> =>
-      listRegistered(opts).map((s) => ({
-        agent: s.agent,
-        sessionId: s.sessionId,
-        title: s.title,
-        cwd: s.cwd,
-        lastActiveAt: s.lastSeenAt,
-      })),
-  };
+export function createRegisteredAdapter(opts: { home?: string; now?: () => number } = {}): AgentAdapter {
+  const listSessions = async (): Promise<SessionInfo[]> => listRegistered(opts).map(toSessionInfo);
+  return { agent: 'external', listSessions };
 }

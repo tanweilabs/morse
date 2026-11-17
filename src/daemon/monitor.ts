@@ -1,61 +1,58 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { morseHome, dataDir } from '../home.js';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as path from 'node:path';
+import { dataDir, morseHome } from '../home.js';
 
-/**
- * Live in-session delivery ("monitor" mode, borrowed from agmsg's design).
- *
- * Instead of the daemon pushing a message via a headless `resume` (which appends
- * an invisible turn — see Codex #28259), the LIVE agent session runs a blocking
- * `morse message --wait` that pulls messages addressed to it and prints them IN ITS OWN
- * TURN, so they appear in the live UI naturally. While a session is monitoring it
- * writes a heartbeat here; the dispatcher checks it and does NOT resume-deliver to
- * a monitored session — it leaves the message pending for the monitor to pull.
- */
+// Monitor heartbeats.
+//
+// A live agent session can follow its own mail with a blocking `morse message --wait`,
+// which prints each message inside the session's current turn (so it shows up in the
+// live UI, unlike a headless resume — Codex #28259). While that loop runs it refreshes
+// a small file `<data>/monitors/<session>` holding the last-seen epoch millis. The
+// dispatch plugin consults it and skips resume-delivery to a session that is watching
+// for itself, leaving the message pending for the loop to pick up.
 
-const FRESH_MS = 10_000;
+/** How long a heartbeat counts as "still monitoring". */
+const STALE_AFTER_MS = 10_000;
 
-/** Session ids become filenames — keep them filesystem-safe. */
-const safe = (sessionId: string): string => sessionId.replace(/[^A-Za-z0-9._-]/g, '_');
-
-function monitorDir(home: string): string {
-  return join(dataDir(home), 'monitors');
+interface HomeOpt {
+  home?: string;
 }
-function monitorPath(sessionId: string, home: string): string {
-  return join(monitorDir(home), safe(sessionId));
+interface ClockOpt extends HomeOpt {
+  now?: () => number;
 }
 
-/** Mark this session as actively monitored (call each poll to keep it fresh). */
-export function heartbeat(sessionId: string, opts: { home?: string; now?: () => number } = {}): void {
-  const home = opts.home ?? morseHome();
-  const now = opts.now ?? Date.now;
-  mkdirSync(monitorDir(home), { recursive: true });
-  writeFileSync(monitorPath(sessionId, home), String(now()), 'utf8');
+/** Map a session id onto a single safe file name inside the monitors folder. */
+function heartbeatFile(home: string, sessionId: string): string {
+  const name = sessionId.replace(/[^\w.-]/g, '_');
+  return path.join(dataDir(home), 'monitors', name);
 }
 
-/** Remove the heartbeat (on monitor exit). Best-effort. */
-export function clearMonitor(sessionId: string, opts: { home?: string } = {}): void {
+/** Record that `sessionId` is monitoring right now. Call on every poll. */
+export function heartbeat(sessionId: string, opts: ClockOpt = {}): void {
+  const file = heartbeatFile(opts.home ?? morseHome(), sessionId);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${(opts.now ?? Date.now)()}`, 'utf8');
+}
+
+/** Drop the heartbeat when the monitor loop exits. Never throws. */
+export function clearMonitor(sessionId: string, opts: HomeOpt = {}): void {
   try {
-    rmSync(monitorPath(sessionId, opts.home ?? morseHome()), { force: true });
+    rmSync(heartbeatFile(opts.home ?? morseHome(), sessionId), { force: true });
   } catch {
-    /* already gone */
+    // nothing to clean up
   }
 }
 
-/** Is this session actively monitoring right now (fresh heartbeat)? */
-export function isMonitored(
-  sessionId: string,
-  opts: { home?: string; now?: () => number; freshMs?: number } = {},
-): boolean {
-  const home = opts.home ?? morseHome();
-  const now = opts.now ?? Date.now;
-  const freshMs = opts.freshMs ?? FRESH_MS;
-  const path = monitorPath(sessionId, home);
-  if (!existsSync(path)) return false;
+/** True while `sessionId` has a heartbeat younger than `freshMs`. */
+export function isMonitored(sessionId: string, opts: ClockOpt & { freshMs?: number } = {}): boolean {
+  let raw: string;
   try {
-    const ts = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
-    return Number.isFinite(ts) && now() - ts <= freshMs;
+    raw = readFileSync(heartbeatFile(opts.home ?? morseHome(), sessionId), 'utf8');
   } catch {
     return false;
   }
+  const seenAt = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(seenAt)) return false;
+  const age = (opts.now ?? Date.now)() - seenAt;
+  return age <= (opts.freshMs ?? STALE_AFTER_MS);
 }

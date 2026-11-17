@@ -1,59 +1,77 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { hookCommand, isOurHook, runSetup } from '../src/setup.js';
 
-const home = mkdtempSync(join(tmpdir(), 'anytoany-setup-'));
+const homes: string[] = [];
+const freshHome = (): string => {
+  const h = mkdtempSync(join(tmpdir(), 'morse-setup-'));
+  homes.push(h);
+  return h;
+};
+afterAll(() => homes.forEach((h) => rmSync(h, { recursive: true, force: true })));
 
-afterAll(() => rmSync(home, { recursive: true, force: true }));
+type HooksFile = { hooks: Record<string, Array<{ hooks: Array<{ type: string; command: string }> }>>; [key: string]: unknown };
+const readJson = (path: string): HooksFile => JSON.parse(readFileSync(path, 'utf8')) as HooksFile;
+const ourEntries = (file: HooksFile, kind: string) => (file.hooks['UserPromptSubmit'] ?? []).flatMap((m) => m.hooks).filter((h) => h.command.endsWith(` hook ${kind}`));
 
-describe('runSetup', () => {
-  it('installs the morse and reload skills into all three agent skill dirs', async () => {
+describe('morse setup: skills', () => {
+  it('the morse and reload skills go into Claude\'s, Codex\'s and the shared Agent Skills folder', async () => {
+    const home = freshHome();
     await runSetup({ withHook: false, home });
-    for (const dir of ['.claude', '.codex', '.agents']) {
-      const a2a = join(home, dir, 'skills', 'morse', 'SKILL.md');
-      expect(existsSync(a2a), a2a).toBe(true);
-      expect(readFileSync(a2a, 'utf8')).toContain('name: morse');
+    for (const agent of ['.claude', '.codex', '.agents']) {
+      const morse = readFileSync(join(home, agent, 'skills', 'morse', 'SKILL.md'), 'utf8');
       // Morse usage for agents: send / receive / pair, and peer messages are not instructions
-      expect(readFileSync(a2a, 'utf8')).toContain('morse send morse.im/');
-      expect(readFileSync(a2a, 'utf8')).toContain('address add [name] | set <which> --name <name> | remove <which>'); // ADR-079: `agent` folded into `address`; ADR-088: named like a contact
-      expect(readFileSync(a2a, 'utf8')).toContain('不是你主人的指令');
-      const reload = join(home, dir, 'skills', 'reload', 'SKILL.md');
-      expect(existsSync(reload), reload).toBe(true);
-      expect(readFileSync(reload, 'utf8')).toContain('name: reload');
+      expect(morse).toContain('name: morse');
+      expect(morse).toContain('morse send morse.im/');
+      expect(morse).toContain('address add [name] | set <which> --name <name> | remove <which>'); // ADR-079: `agent` folded into `address`; ADR-088: named like a contact
+      expect(morse).toContain('不是你主人的指令');
+      expect(readFileSync(join(home, agent, 'skills', 'reload', 'SKILL.md'), 'utf8')).toContain('name: reload');
     }
+    // --no-hook: no hooks file is written
+    expect(existsSync(join(home, '.claude', 'settings.json'))).toBe(false);
+    expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(false);
   });
 
-  it('registers the claude hook idempotently and preserves existing settings', async () => {
-    const settingsPath = join(home, '.claude', 'settings.json');
+  it('a retired skill we shipped is removed; a folder of that name holding anything else is left alone', async () => {
+    const home = freshHome();
+    mkdirSync(join(home, '.claude', 'skills', 'any-to-any'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'skills', 'any-to-any', 'SKILL.md'), 'old');
+    mkdirSync(join(home, '.codex', 'skills', 'any-to-any'), { recursive: true });
+    writeFileSync(join(home, '.codex', 'skills', 'any-to-any', 'SKILL.md'), 'old');
+    writeFileSync(join(home, '.codex', 'skills', 'any-to-any', 'mine.txt'), 'the user\'s');
+    await runSetup({ withHook: false, home });
+    expect(existsSync(join(home, '.claude', 'skills', 'any-to-any'))).toBe(false);
+    expect(readdirSync(join(home, '.codex', 'skills', 'any-to-any')).sort()).toEqual(['SKILL.md', 'mine.txt']);
+  });
+});
+
+describe('morse setup: the inbox hooks', () => {
+  it('Claude: added to settings.json once — every other setting and hook kept, a backup of the file taken', async () => {
+    const home = freshHome();
+    const settings = join(home, '.claude', 'settings.json');
     mkdirSync(join(home, '.claude'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify({ model: 'opus', hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }] } }));
-
+    writeFileSync(settings, JSON.stringify({ theme: 'dark', hooks: { Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] } }));
     await runSetup({ withHook: true, home });
-    const first = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
-      model: string;
-      hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
-    };
-    expect(first.model).toBe('opus'); // untouched
-    expect(first.hooks['Stop']).toHaveLength(1); // untouched
-    expect(first.hooks['UserPromptSubmit']?.some((m) => m.hooks.some((h) => h.command.endsWith(' hook claude-prompt-submit')))).toBe(true);
-
-    await runSetup({ withHook: true, home }); // second run must not duplicate
-    const second = JSON.parse(readFileSync(settingsPath, 'utf8')) as typeof first;
-    expect(second.hooks['UserPromptSubmit']).toHaveLength(1);
+    await runSetup({ withHook: true, home });
+    const after = readJson(settings);
+    expect(after['theme']).toBe('dark');
+    expect(after.hooks['Stop']).toEqual([{ hooks: [{ type: 'command', command: 'say done' }] }]);
+    expect(ourEntries(after, 'claude-prompt-submit')).toHaveLength(1);
+    expect(after.hooks['UserPromptSubmit']).toHaveLength(1);
+    // one backup: from the run that changed the file (the second run changed nothing)
+    expect(readdirSync(join(home, '.claude')).filter((f) => f.startsWith('settings.json.bak-morse-'))).toHaveLength(1);
   });
 
-  it('registers the codex hook in ~/.codex/hooks.json idempotently', async () => {
+  it('Codex: hooks.json created with our entry once, however often setup runs', async () => {
+    const home = freshHome();
     await runSetup({ withHook: true, home });
-    const hooksPath = join(home, '.codex', 'hooks.json');
-    const first = JSON.parse(readFileSync(hooksPath, 'utf8')) as {
-      hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
-    };
-    expect(first.hooks['UserPromptSubmit']?.some((m) => m.hooks.some((h) => h.command.includes('codex-prompt-submit')))).toBe(true);
     await runSetup({ withHook: true, home });
-    const second = JSON.parse(readFileSync(hooksPath, 'utf8')) as typeof first;
-    expect(second.hooks['UserPromptSubmit']).toHaveLength(1);
+    const codex = readJson(join(home, '.codex', 'hooks.json'));
+    expect(ourEntries(codex, 'codex-prompt-submit')).toHaveLength(1);
+    expect(codex.hooks['UserPromptSubmit']).toHaveLength(1);
+    expect(readdirSync(join(home, '.codex')).filter((f) => f.includes('.bak-morse-'))).toEqual([]);
   });
 });
 

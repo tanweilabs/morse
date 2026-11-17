@@ -1,47 +1,39 @@
-# Phase 3 规格 — ZCode adapter（第三家：智谱 Z.ai）
+# ZCode 投递通道
 
-> 创建：2026-08-06 · 最后更新：2026-11-14
-> **名字说明（2026-11-14）**：文中的 `anyd`、`~/.anytoany/` 是当时的名字，属于历史写法，正文不改；命令行现在叫 `morse`，数据目录是 `~/.morse/`（ADR-033、ADR-035）。
-> 状态：已实施（发现+投递管道实测通过；投递的模型层 auth 待用户侧动作——见母调研 §7.7，升级 App 跑 `zcode login` 或手配 API key）。母调研：[research-zcode.md](../research/research-zcode.md)
-> 动机：用户要用 MacBook 的 Codex ↔ Mac mini 的 ZCode 跨机通信（两台机都装了 ZCode 桌面客户端）。
-> 实测调整：argv 去掉 `--max-turns`（0.15.2 解析器不认，见母调研 §7.1）；db 路径固定不随 `ZCODE_DATA_BASE_DIR`（§7.3）。
+> 创建：2026-08-06 · 最后更新：2026-11-17（按现状重写，并入原调研里还用得上的事实）
+> 代码：`src/adapters/zcode.ts`、`src/adapters/zcode-mailbox.ts`。相关决策：ADR-029（ZCode 门铃）。
 
-## 1. 发现（listSessions）
+ZCode 是智谱（Z.ai）的桌面 ADE，不是 Zed 编辑器。桌面版内置完整的 CLI 引擎，桌面版和 CLI 共用一份会话库，所以从外面续接的回合在桌面版里直接看得见。
 
-- 数据源：`$ZCODE_DATA_BASE_DIR|~/.zcode` + `/cli/db/db.sqlite`，better-sqlite3 **readonly** 打开（App 常驻 WAL 写入中），查完即关。
-- 查询 `SELECT * FROM session`，JS 层宽松过滤（防版本列漂移整查询失败）：
-  - 排除 `task_type = 'subagent_child'`、`parent_id` 非空、id 前缀 `sess_subagent`（对齐 Codex 子代理过滤经验：子会话拒收直接输入）
-- 映射：`sessionId = id`（保留 `sess_` 前缀，resume 直接可用）· `title = title || basename(directory) || 'untitled'`（80 截断）· `cwd = directory` · `lastActiveAt = time_updated`（已是 ms）。
-- db 打不开/表不存在 → 返回 `[]`（未装 ZCode 的机器静默跳过）。
+## 找会话
 
-## 2. 投递（deliver）
+- 只读方式打开 `~/.zcode/cli/db/db.sqlite`（桌面版一直在用 WAL 写它），`SELECT * FROM session`，查完就关。路径写死：实测 `ZCODE_DATA_BASE_DIR` 只挪凭据，不挪这个库。
+- 去掉子代理会话：id 以 `sess_subagent` 开头、`parent_id` 不为空、或 `task_type = 'subagent_child'`。子会话不接受直接输入。
+- 字段在 JS 里宽松地取，防止版本之间列名变化让整条查询失败：id 原样（带 `sess_` 前缀，可直接续接）；标题 = `title`，没有就用目录名，再没有就 `untitled`（最长 80 字）；目录 = `directory`；最近活跃 = `time_updated`（毫秒）。
+- 库打不开或没有这张表：当作没装 ZCode，返回空。
 
-- 引擎解析优先级：`ANYTOANY_ZCODE_BIN` env → PATH 上的 `zcode`（当前官方无此分发，预留）→ `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`。`.cjs` 用 `node` 执行。
-- argv：`--cwd <cwd>（有则传）--resume <sessionId> --mode build --max-turns 25 --prompt <envelope>`
-- **安全底线：显式 `--mode build`**——`--prompt` 无头默认 yolo（跳过全部权限确认），绝不隐式继承；build 为 ZCode 常规工作模式，等价 codex exec 默认权限层级。
-- **权限模式与机主授权（2026-08-07 增补，真实协作暴露）**：build 模式下需确认的工具在无头回合会被直接拒绝（无人点确认）→ 会话事实只读，Codex 指挥 ZCode 写系统即卡死。定案：**机主显式提权**——目标机器的 `~/.anytoany/config.json` 写 `{ "zcode": { "deliverMode": "yolo" } }`（白名单校验 plan/edit/build/yolo，非法值回退 build；每次投递实时读盘，改配置免重启）。提权决定权只在机主手里，发消息的 agent 永远无法指定模式。风险边界如实告知：开启后该机被唤起的 ZCode 回合无确认执行命令，信封防注入是提示层非强制层，仅建议在自有集群（token 独享）内开启。此为「投递级权限档案」（P3）第一块砖。
-- 超时 300s；失败取 stderr 尾部 500 字符（错误在横幅回显之后，对齐 codex 经验）。
-- 不用 `--json`：回信抽取靠 stdout 文本中的 REPLY_MARKER，JSON 转义会污染 marker 之后的正文。
+## 投递
 
-## 3. 联动面
+找引擎的顺序：`MORSE_ZCODE_BIN`（旧名 `ANYTOANY_ZCODE_BIN` 仍认）→ PATH 里的 `zcode` → `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`（`.cjs` 用 `node` 跑）。
 
-- `defaultAdapters()` 注册第三家 → 目录扫描、@any 物化（`any-zcode-*`）、hook digest、webui 自动生效。
-- webui：`AGENT_COLORS['zcode']` + `AGENT_LOGOS['zcode']`（App icon 提取位图，三级兜底走位图层）。
-- 收件可见性（P3 跟踪）：ZCode 有 Claude 同款 `UserPromptSubmit` hook——`anyd setup` 未来可加 ZCode hook 安装；`app-server`（ZCode Protocol）与门控中的原生 mailbox 是实时通道升级路径。
+**会话空闲时**：起一个 headless 回合续接：
 
-## 4. 验收
+```
+[--cwd <目录>] --resume <sessionId> --mode <模式> --prompt <信封>
+```
 
-1. 单测：fixture SQLite 建 `session` 表——interactive 入选、subagent 三种形态全过滤、title/cwd/时间映射正确、db 缺失返回空；deliver 断言 argv（含 `--mode build` 非 yolo）、错误含 stderr 尾部。
-2. 真机（本机装有 ZCode 3.5.3）：`ZCODE_DATA_BASE_DIR` 隔离环境跑通「创建 → resume 续接」全流程（不碰用户真实会话库写入）；真实库只做只读扫描验证。
-3. 跨机：mini 更新 anytoany 后，MacBook 侧 `anyd list` 出现 `@<mini>/zcode/...` 条目；Codex→ZCode 首条真实消息由用户发起验证（不注入测试消息到真实会话）。
+- 模式默认 `build`。`--prompt` 不写模式时默认是 yolo（所有确认都跳过），所以一定显式传。`build` 下需要确认的工具在无人值守的回合里会被拒，等于只读。
+- 机主可以在本机 `~/.morse/config.json` 里放开：`{"zcode": {"deliverMode": "yolo"}}`（只认 `plan` / `edit` / `build` / `yolo`，别的值回到 `build`）；单回合时限 `zcode.deliverTimeoutSec`（60–3600 秒，默认 300）。每次投递现读配置，改了不用重启。发信的一方永远指定不了模式。
+- 不加 `--max-turns`（0.15.2 的解析器不认），也不用 `--json`（JSON 转义会破坏回信标记后面的正文）；回信从 stdout 里按标记取。退出码非 0 就失败，错误带 stderr 最后 500 字。
 
-## 门铃（2026-10-13，ADR-029）
+**会话正在跑回合时（门铃，ADR-029）**：再起一个回合等于两个写者同时写一个会话，所以改走 ZCode 自己的会话信箱（未公开功能）：
 
-- **问题**：会话正在跑一个回合时，`--resume --prompt` 会再起一个回合，两个写者同时写同一个会话。
-- **入口**：ZCode 原生会话信箱（未公开，开关 `ZCODE_MESSAGE_ENABLED=1`）。信写到 `~/.zcode/mailbox/<sess>/unread/<时间戳>-<id>.json`，格式 `{version:1, messageId, fromSessionId, toSessionId, content, createdAt}`。ZCode 在 `UserPromptSubmit` / `PostToolUse` / `Stop` 三个时点领取。
-- **路由**（`src/adapters/zcode.ts` + `zcode-mailbox.ts`）：会话**正在跑回合**（最新助手消息没有 `time.completed`，30 分钟内）**且**信箱目录存在（ZCode 带开关跑过回合时自己建的）→ 原子写入信箱，信封切到 `anyd reply` 回信；每秒检查一次，被领走即送达。**回合结束仍没被领走 → `rename` 原子收回 → 照旧 `--resume`**。其余情况照旧 `--resume`。路由结论缓存 5 秒，回信方式和投递方式保持一致。
-- **为什么不读进程环境变量判断开关**：ZCode 会把进程名改成 `zcode-cli`，覆盖了 `ps eww` 读环境变量的那块内存（实测）。
-- **doctor**：`zcode doorbell (session mailbox)` 一项显示开 / 关，以及开启方法。
-- **实测**：真 daemon、测试会话、带开关跑 `sleep 30` 的回合中发信 → 信进 `unread` → 回合内被领取，模型照做并 `anyd reply` 回信 → 送达一次。不带开关的回合 → 信留在 `unread` → 回合结束后被收回 → `--resume` 送达，回信一次。
-- **待验证**：桌面版。它用同一个运行时（以子进程 `glm/zcode.cjs app-server --stdio` 启动，只额外设了 `ELECTRON_RUN_AS_NODE`），按源码判断会继承开关，需要机主开启开关后在桌面版里跑一个回合，再用 `anyd doctor` 确认。
+- 开关是环境变量 `ZCODE_MESSAGE_ENABLED=1`；信箱在 `ZCODE_MAILBOX_ROOT`，默认 `~/.zcode/mailbox/<会话>/{unread,read}/`。信件格式 `{version:1, messageId, fromSessionId, toSessionId, content, createdAt}`。ZCode 在 `UserPromptSubmit`、`PostToolUse`（插进当前回合）和 `Stop`（带着信继续）三个时点领信，空闲会话不会被叫醒。
+- 判断「正在跑」：最新一条消息是还没有 `time.completed` 的助手消息（30 分钟内），或者是 60 秒内刚写的用户消息。
+- 判断「开关开着」：读不了进程环境（ZCode 改了进程名，把那块内存覆盖了），改看痕迹：开着开关的运行时每个回合开头都会建好该会话的 `unread/` 目录。
+- 两个条件都满足 → 先写临时文件再 `rename` 进 `unread/`，信封改成让对方用 `morse reply` 回信；每秒看一次，文件没了就是送达（记为会话内送达）。回合结束信还在 → 再用 `rename` 原子收回，照旧续接。收回和领取只会有一个成功，不丢也不重。路由结论缓存 5 秒，保证回信方式和投递方式一致。
+- 不写 ZCode 内部的 `session_input` 表。`morse doctor` 报告信箱开关的状态和打开方法（`launchctl setenv ZCODE_MESSAGE_ENABLED 1` 后重开 ZCode）；Morse 不替机主改。
 
+## 还没确认的
+
+桌面版门铃：桌面版以子进程跑同一个引擎（`glm/zcode.cjs app-server --stdio`），按源码应当继承开关，还要在开着开关的桌面版里实际跑一个回合确认。

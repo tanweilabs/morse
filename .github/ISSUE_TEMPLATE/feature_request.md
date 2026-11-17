@@ -4,10 +4,14 @@ about: New agent adapter, delivery channel, or workflow idea
 labels: enhancement
 ---
 
-**The problem / use case**
+## What you are trying to do
 
-**Proposed solution**
+<!-- The situation, and why Morse gets in the way today. -->
 
-**Alternatives considered**
+## What would help
 
-**Additional context** (e.g. which agent CLI, which vendor channel — see docs/research/ for what's already mapped)
+## Other ways you considered
+
+## Anything else
+
+<!-- Which agent CLI or vendor channel is involved? docs/research/ has what has been looked into already. -->

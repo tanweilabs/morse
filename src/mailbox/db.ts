@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { morseHome, dataDir } from '../home.js';
+import { dataDir } from '../home.js';
 import Database from 'better-sqlite3';
 import type { ContactContext } from './contacts.js';
 import { homeContactContext } from './home-context.js';
@@ -13,95 +13,168 @@ import { REQUESTS_TABLE } from './requests.js';
 
 export type Db = Database.Database;
 
+/** Where the mailbox lives unless a caller names another file: `<data>/mailbox.db`. */
 export function defaultDbPath(): string {
   return join(dataDir(), 'mailbox.db');
 }
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY,
-  pair_key TEXT NOT NULL UNIQUE,
-  a_agent TEXT NOT NULL,
-  a_session TEXT NOT NULL,
-  a_device TEXT,
-  b_agent TEXT NOT NULL,
-  b_session TEXT NOT NULL,
-  b_device TEXT,
-  created_at INTEGER NOT NULL,
-  last_message_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(id),
-  context_id TEXT NOT NULL,
-  from_agent TEXT NOT NULL,
-  from_session TEXT NOT NULL,
-  from_device TEXT,
-  to_agent TEXT NOT NULL,
-  to_session TEXT NOT NULL,
-  to_device TEXT,
-  parts TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  attempts INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_context ON messages(context_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, status);
-CREATE TABLE IF NOT EXISTS inbound_seen (
-  from_id TEXT NOT NULL,
-  msg_id TEXT NOT NULL,
-  seen_at INTEGER NOT NULL,
-  PRIMARY KEY (from_id, msg_id)
-);
--- Morse message requests (ADR-037): the first message of a person who is not paired
--- here waits in this table — never in messages, so no inbox, pull or agent sees it —
--- until the operator accepts (moved into messages) or declines (deleted + blocked).
--- One row per (address of mine, sender) since schema v4 (ADR-083); later messages only bump count / last_at.
-${REQUESTS_TABLE}
-CREATE TABLE IF NOT EXISTS sessions_cache (
-  agent TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  title TEXT NOT NULL,
-  cwd TEXT NOT NULL,
-  last_active_at INTEGER NOT NULL,
-  PRIMARY KEY (agent, session_id)
-);
-`;
+// ---------------------------------------------------------------------------------------------
+// Base schema. Each table is listed as data and rendered to its CREATE statement below; the
+// rendered text is what SQLite keeps in sqlite_master (and what the contact backups copy), so the
+// column order and wording here are part of the on-disk format — append, never edit.
+// ---------------------------------------------------------------------------------------------
 
-/** Phase 2 additive columns for databases created by Phase 1. */
-const MIGRATIONS = [
-  `ALTER TABLE conversations ADD COLUMN a_device TEXT`,
-  `ALTER TABLE conversations ADD COLUMN b_device TEXT`,
-  `ALTER TABLE messages ADD COLUMN from_device TEXT`,
-  `ALTER TABLE messages ADD COLUMN to_device TEXT`,
-  // 1 = delivered INTO the target's own live session (codex queue, zcode mailbox):
-  // that turn is the session's own, so the hook digest must never call it background work
-  `ALTER TABLE messages ADD COLUMN delivered_in_session INTEGER`,
-  // Morse: trust tier of the SENDING device for inbound cross-device mail.
-  // 'peer' = someone else's device — pull-only, never carries operator authority.
-  `ALTER TABLE messages ADD COLUMN from_tier TEXT`,
-  // Morse: when the recipient device confirmed (end-to-end receipt over the relay)
-  `ALTER TABLE messages ADD COLUMN receipt_at INTEGER`,
-  // Morse: 1 = the recipient is simply not reachable yet (offline device, relay
-  // down, no receipt). Retried until it is, for up to the outbox's max wait —
-  // never dead-lettered after 3 tries like a local delivery failure.
-  `ALTER TABLE messages ADD COLUMN waiting INTEGER NOT NULL DEFAULT 0`,
-  // Morse (ADR-037), sender side: 1 = it landed in the recipient's message requests —
-  // they have not accepted us yet. Cleared when they do.
-  `ALTER TABLE messages ADD COLUMN request INTEGER NOT NULL DEFAULT 0`,
-  // Morse (ADR-038): names and sizes of the attachments a message request did not keep
-  // (JSON [{name,size}]) — the sender's device sends them once the request is accepted.
-  `ALTER TABLE morse_requests ADD COLUMN dropped_file_list TEXT`,
-  // ADR-071: 1 = another person's reply in a thread one of OUR sessions (or the CLI)
-  // started — filed to that session, never handed to the attendant.
-  `ALTER TABLE messages ADD COLUMN own_thread INTEGER NOT NULL DEFAULT 0`,
-  // ADR-081 (ADR-081 review F1, F3): the address of this computer a message request was written to. Set = the
-  // request arrived BY ADDRESS (signed by the address in `handle`); NULL = the old way, from a device.
-  `ALTER TABLE morse_requests ADD COLUMN to_address TEXT`,
+/** `[column name, type and constraints]` */
+type ColumnDef = readonly [string, string];
+
+interface TableDef {
+  name: string;
+  columns: readonly ColumnDef[];
+  /** table-level constraints, rendered after the columns */
+  constraints?: readonly string[];
+}
+
+const CONVERSATIONS_TABLE: TableDef = {
+  name: 'conversations',
+  columns: [
+    ['id', 'TEXT PRIMARY KEY'],
+    ['pair_key', 'TEXT NOT NULL UNIQUE'],
+    ['a_agent', 'TEXT NOT NULL'],
+    ['a_session', 'TEXT NOT NULL'],
+    ['a_device', 'TEXT'],
+    ['b_agent', 'TEXT NOT NULL'],
+    ['b_session', 'TEXT NOT NULL'],
+    ['b_device', 'TEXT'],
+    ['created_at', 'INTEGER NOT NULL'],
+    ['last_message_at', 'INTEGER NOT NULL'],
+  ],
+};
+
+const MESSAGES_TABLE: TableDef = {
+  name: 'messages',
+  columns: [
+    ['id', 'TEXT PRIMARY KEY'],
+    ['conversation_id', 'TEXT NOT NULL REFERENCES conversations(id)'],
+    ['context_id', 'TEXT NOT NULL'],
+    ['from_agent', 'TEXT NOT NULL'],
+    ['from_session', 'TEXT NOT NULL'],
+    ['from_device', 'TEXT'],
+    ['to_agent', 'TEXT NOT NULL'],
+    ['to_session', 'TEXT NOT NULL'],
+    ['to_device', 'TEXT'],
+    ['parts', 'TEXT NOT NULL'],
+    ['status', "TEXT NOT NULL DEFAULT 'pending'"],
+    ['attempts', 'INTEGER NOT NULL DEFAULT 0'],
+    ['last_error', 'TEXT'],
+    ['created_at', 'INTEGER NOT NULL'],
+    ['updated_at', 'INTEGER NOT NULL'],
+  ],
+};
+
+/** Ids of inbound cross-device messages already accepted, so a resend is not filed twice. */
+const INBOUND_SEEN_TABLE: TableDef = {
+  name: 'inbound_seen',
+  columns: [
+    ['from_id', 'TEXT NOT NULL'],
+    ['msg_id', 'TEXT NOT NULL'],
+    ['seen_at', 'INTEGER NOT NULL'],
+  ],
+  constraints: ['PRIMARY KEY (from_id, msg_id)'],
+};
+
+const SESSIONS_CACHE_TABLE: TableDef = {
+  name: 'sessions_cache',
+  columns: [
+    ['agent', 'TEXT NOT NULL'],
+    ['session_id', 'TEXT NOT NULL'],
+    ['title', 'TEXT NOT NULL'],
+    ['cwd', 'TEXT NOT NULL'],
+    ['last_active_at', 'INTEGER NOT NULL'],
+  ],
+  constraints: ['PRIMARY KEY (agent, session_id)'],
+};
+
+/** `[index name, table, column list]` */
+const MESSAGE_INDEXES: ReadonlyArray<readonly [string, string, string]> = [
+  ['idx_messages_status', 'messages', 'status, created_at'],
+  ['idx_messages_context', 'messages', 'context_id, created_at'],
+  ['idx_messages_to', 'messages', 'to_session, status'],
 ];
+
+function createTableSql(table: TableDef): string {
+  const body = [...table.columns.map(([col, type]) => `${col} ${type}`), ...(table.constraints ?? [])];
+  return `CREATE TABLE IF NOT EXISTS ${table.name} (\n${body.map((line) => `  ${line}`).join(',\n')}\n);`;
+}
+
+/**
+ * Every statement that brings an empty file to the base layout, in order. The message-requests
+ * table (ADR-037) is defined next to its code in requests.ts: a stranger's first message waits
+ * there, outside `messages`, until the operator accepts or declines it — one row per
+ * (my address, sender) since schema v4 (ADR-083).
+ */
+const BASE_SCHEMA: readonly string[] = [
+  createTableSql(CONVERSATIONS_TABLE),
+  createTableSql(MESSAGES_TABLE),
+  ...MESSAGE_INDEXES.map(([name, table, cols]) => `CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${cols});`),
+  createTableSql(INBOUND_SEEN_TABLE),
+  REQUESTS_TABLE,
+  createTableSql(SESSIONS_CACHE_TABLE),
+];
+
+/**
+ * Columns added after the base layout, applied on every open (a database that already has one
+ * simply rejects the ALTER). `[table, column, type]`; order matters for sqlite_master's text.
+ */
+const ADDED_COLUMNS: ReadonlyArray<readonly [string, string, string]> = [
+  // Phase 2: devices on both ends
+  ['conversations', 'a_device', 'TEXT'],
+  ['conversations', 'b_device', 'TEXT'],
+  ['messages', 'from_device', 'TEXT'],
+  ['messages', 'to_device', 'TEXT'],
+  // 1 = the message ran inside the target's own live session (Codex queue, ZCode mailbox), so the
+  // prompt-hook digest must not report that turn as background work
+  ['messages', 'delivered_in_session', 'INTEGER'],
+  // trust tier of the sending device for inbound cross-device mail; 'peer' = someone else's device
+  // (pull-only, never carries operator authority)
+  ['messages', 'from_tier', 'TEXT'],
+  // when the recipient device confirmed receipt end to end over the relay
+  ['messages', 'receipt_at', 'INTEGER'],
+  // 1 = the recipient is just not reachable yet (offline, relay down, no receipt): retried for as
+  // long as the outbox allows instead of dead-lettering after three local failures
+  ['messages', 'waiting', 'INTEGER NOT NULL DEFAULT 0'],
+  // ADR-037, sender side: 1 = it sits in the recipient's message requests until they accept us
+  ['messages', 'request', 'INTEGER NOT NULL DEFAULT 0'],
+  // ADR-038: JSON [{name,size}] of attachments a request did not keep; sent once it is accepted
+  ['morse_requests', 'dropped_file_list', 'TEXT'],
+  // ADR-071: 1 = another person's reply in a thread one of our sessions (or the CLI) began —
+  // filed to that session, never given to the attendant
+  ['messages', 'own_thread', 'INTEGER NOT NULL DEFAULT 0'],
+  // ADR-081 (review F1, F3): which address of this computer a request was written to. Set = it came
+  // by address, signed by the address in `handle`; NULL = the older device-to-device way.
+  ['morse_requests', 'to_address', 'TEXT'],
+];
+
+/** Lay down the base tables and the additive columns. Safe to repeat on any existing mailbox. */
+function applyBaseSchema(db: Db): void {
+  db.exec(BASE_SCHEMA.join('\n'));
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    } catch {
+      // already there (or a read-only open): either way nothing to add
+    }
+  }
+}
+
+/** Open the SQLite file (creating its folder), with the connection settings every caller relies on. */
+function openSqlite(file: string): { db: Db; existed: boolean } {
+  const inMemory = file === ':memory:';
+  if (!inMemory) mkdirSync(dirname(file), { recursive: true });
+  const existed = !inMemory && existsSync(file);
+  const db = new Database(file);
+  for (const setting of ['journal_mode = WAL', 'foreign_keys = ON', 'busy_timeout = 5000']) db.pragma(setting);
+  return { db, existed };
+}
 
 /**
  * ADR-089: a delivery belongs to its holder — the lease of a row that is 'delivering'. holder: a random id
@@ -236,22 +309,13 @@ export function mailboxVersion(path: string = defaultDbPath()): number | null {
   }
 }
 
-/** Open (creating if needed) the mailbox database. Pass ':memory:' in tests. */
+/**
+ * Open the mailbox database, creating it when missing, and bring it to CURRENT_SCHEMA_VERSION.
+ * Tests pass ':memory:'.
+ */
 export function createDb(path: string = defaultDbPath(), opts: CreateDbOptions = {}): Db {
-  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-  const existed = path !== ':memory:' && existsSync(path);
-  const db = new Database(path);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
-  db.exec(SCHEMA);
-  for (const migration of MIGRATIONS) {
-    try {
-      db.exec(migration);
-    } catch {
-      /* column already exists — idempotent by design */
-    }
-  }
+  const { db, existed } = openSqlite(path);
+  applyBaseSchema(db);
   const ctx = opts.ctx ?? (path === defaultDbPath() ? homeContactContext() : {});
   const now = opts.now ?? Date.now;
   /** A copy this very open already took of the untouched database (v1 → v2 → v3 in one go needs one). */

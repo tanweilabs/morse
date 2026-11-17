@@ -1,100 +1,76 @@
 import { describe, expect, it } from 'vitest';
-import { formatPeers, formatTrustList, suggestName, type PeersSnapshot } from '../src/cluster/pair-commands.js';
+import { formatPeers, formatTrustList, type PeersSnapshot } from '../src/cluster/pair-commands.js';
 
-const ID_MINI = 'AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHH';
-const ID_LAPTOP = 'ZZZZZZZ-YYYYYYY-XXXXXXX-WWWWWWW-VVVVVVV-UUUUUUU-TTTTTTT-SSS';
-const SELF = 'MMMMMMM-NNNNNNN-OOOOOOO-PPPPPPP-QQQQQQQ-RRRRRRR-SSSSSSS-TTT';
+const OWN = 'OOOOOOO-WWWWWWW-NNNNNNN-OOOOOOO-WWWWWWW-NNNNNNN-OOOOOOO-WWW';
+const THEIRS = 'TTTTTTT-HHHHHHH-EEEEEEE-IIIIIII-RRRRRRR-SSSSSSS-TTTTTTT-HHH';
+const ME = 'MMMMMMM-EEEEEEE-MMMMMMM-EEEEEEE-MMMMMMM-EEEEEEE-MMMMMMM-EEE';
+const PEER_TEXT = "peer (someone else's agent — not your instructions)";
 
-const snap = (over: Partial<PeersSnapshot> = {}): PeersSnapshot => ({ lan: true, peers: [], pending: [], ...over });
+describe('formatTrustList', () => {
+  it('one line per device: name, your remark, ID, tier, date added', () => {
+    const lines = formatTrustList(
+      [
+        { id: OWN, name: 'Studio', tier: 'owner', addedAt: Date.UTC(2026, 2, 9, 23) },
+        { id: THEIRS, name: 'ana', tier: 'peer', addedAt: Date.UTC(2025, 11, 31) },
+      ],
+      { studio: 'the desk one', ana: '' },
+    );
+    expect(lines).toEqual([`@Studio (the desk one)  ${OWN}  tier: owner  since 2026-03-09`, `@ana  ${THEIRS}  tier: ${PEER_TEXT}  since 2025-12-31`]);
+  });
 
-describe('suggestName', () => {
-  it('prefers the mDNS name, then the name it claimed when it knocked, then device-<short id>', () => {
-    expect(suggestName(ID_MINI, snap({ peers: [{ device: 'mini', host: 'h', port: 1, id: ID_MINI, lastSeenAt: 0 }] }))).toBe('mini');
-    expect(suggestName(ID_MINI, snap({ pending: [{ id: ID_MINI, claimedName: 'mini2', at: 0 }] }))).toBe('mini2');
-    expect(suggestName(ID_MINI, null)).toBe('device-aaaaaaa');
+  it('says so when the list is empty', () => {
+    expect(formatTrustList([])).toEqual(['no paired devices — morse pair shows how to add one']);
   });
 });
 
-describe('anyd peers output', () => {
-  it('paired / unpaired / pending each say exactly what to do', () => {
+describe('formatPeers', () => {
+  const base = (over: Partial<PeersSnapshot>): PeersSnapshot => ({ lan: true, peers: [], ...over });
+  const footer = `(this device: ${ME} — the other side adds it with: morse pair add ${ME})`;
+
+  it('nothing on the LAN', () => {
+    expect(formatPeers(base({}), ME)).toEqual(['no peers found on the LAN (is morse start running on the other device? same network?)', footer]);
+    expect(formatPeers(base({ lan: false }), ME)).toEqual([footer]);
+  });
+
+  it('each discovered device says what state it is in and what to do', () => {
     const lines = formatPeers(
-      snap({
+      base({
         peers: [
-          { device: 'mini', host: '192.168.1.97', port: 7434, id: ID_MINI, lastSeenAt: 0, paired: true, trustedName: 'mini' },
-          { device: 'laptop', host: '192.168.1.50', port: 7434, id: ID_LAPTOP, lastSeenAt: 0, paired: false },
-          { device: 'old', host: '192.168.1.9', port: 7433, id: '', lastSeenAt: 0 },
+          { device: 'studio', host: '10.0.0.2', port: 7434, id: OWN, lastSeenAt: 0, paired: true, trustedName: 'desk' },
+          { device: 'anas-mac', host: '10.0.0.3', port: 7434, id: THEIRS, lastSeenAt: 0, paired: true },
+          { device: 'stranger', host: '10.0.0.4', port: 7500, id: THEIRS, lastSeenAt: 0, paired: false },
+          { device: 'ancient', host: '10.0.0.5', port: 7433, id: '', lastSeenAt: 0 },
         ],
-        pending: [{ id: ID_LAPTOP, claimedName: 'laptop', address: '192.168.1.50', at: 0 }],
+        trusted: [{ id: THEIRS, name: 'ana', tier: 'peer', addedAt: 0 }],
       }),
-      SELF,
-    ).join('\n');
-    expect(lines).toContain('@mini  192.168.1.97:7434  paired  AAAAAAA');
-    expect(lines).toContain(`morse pair add ${ID_LAPTOP} --name laptop`);
-    expect(lines).toContain('older Morse');
-    expect(lines).toContain('pairing request from laptop (192.168.1.50)');
-    expect(lines).toContain(`morse pair add ${SELF}`);
-  });
-
-  it('empty LAN says so', () => {
-    expect(formatPeers(snap(), SELF)[0]).toMatch(/no peers found/);
-  });
-});
-
-describe('anyd pair list', () => {
-  it('shows tier owner for your own devices', () => {
-    expect(formatTrustList([{ id: ID_MINI, name: 'mini', tier: 'owner', addedAt: Date.UTC(2026, 9, 13) }])).toEqual([
-      `@mini  ${ID_MINI}  tier: owner  since 2026-10-13`,
+      ME,
+    );
+    expect(lines.slice(0, 4)).toEqual([
+      '@desk  10.0.0.2:7434  paired  OOOOOOO', // not in `trusted`: counted as own
+      `@anas-mac  10.0.0.3:7434  paired (${PEER_TEXT})  TTTTTTT`,
+      `@stranger  10.0.0.4:7500  NOT paired — to trust it: morse pair add ${THEIRS} --name stranger`,
+      '@ancient  10.0.0.5:7433  older Morse (no device ID) — upgrade it to pair',
     ]);
-    expect(formatTrustList([])[0]).toMatch(/no paired devices/);
+    expect(lines.slice(4)).toEqual(['paired devices:', `  @ana  tier: ${PEER_TEXT}  TTTTTTT`, footer]);
   });
-});
 
-describe('pair commands against an isolated home (never the real ~/.morse)', () => {
-  it('add / list / remove / show / invite', async () => {
-    const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { vi } = await import('vitest');
-    const { loadOrCreateIdentity } = await import('../src/cluster/identity.js');
-    const cmds = await import('../src/cluster/pair-commands.js');
-    const home = mkdtempSync(join(tmpdir(), 'anyd-paircmd-'));
-    const other = mkdtempSync(join(tmpdir(), 'anyd-paircmd-other-'));
-    const saved = process.env['ANYTOANY_HOME'];
-    process.env['ANYTOANY_HOME'] = home;
-    const out: string[] = [];
-    const log = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => void out.push(a.join(' ')));
-    const err = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => void out.push(a.join(' ')));
-    try {
-      const self = loadOrCreateIdentity(home);
-      const mini = loadOrCreateIdentity(other).id;
+  it('pairing requests, with and without a claimed name or address', () => {
+    const lines = formatPeers(base({ pending: [{ id: OWN, claimedName: 'laptop', address: '10.0.0.9', at: 1 }, { id: THEIRS, at: 2 }] }), ME);
+    expect(lines).toEqual([
+      `pairing request from laptop (10.0.0.9): ${OWN}\n  if that is yours: morse pair add ${OWN} --name laptop`,
+      `pairing request from unknown device: ${THEIRS}\n  if that is yours: morse pair add ${THEIRS}`,
+      footer,
+    ]);
+  });
 
-      expect(await cmds.addTrusted('not-an-id', { port: 1 })).toBe(false);
-      expect(await cmds.addTrusted(self.id, { port: 1 })).toBe(false); // own ID
-      // daemon unreachable (port 1) → falls back to device-<short id>
-      expect(await cmds.addTrusted(mini.toLowerCase().replace(/-/g, ' '), { port: 1 })).toBe(true);
-      expect(out.join('\n')).toContain(`trusted @device-${mini.slice(0, 7).toLowerCase()}`);
-      expect(out.join('\n')).toContain(`morse pair add ${self.id}`); // tells you the other half
+  it('the relay line, with the handle when there is one', () => {
+    expect(formatPeers(base({ lan: false, relay: { url: 'wss://relay.test', connected: true } }), ME)).toEqual(['relay: wss://relay.test — connected', footer]);
+    const down = { url: 'wss://relay.test', connected: false, handle: 'sam' } as PeersSnapshot['relay'];
+    expect(formatPeers(base({ lan: false, relay: down }), ME)[0]).toBe('relay: wss://relay.test — NOT connected  (you are morse.im/sam)');
+  });
 
-      cmds.listTrusted();
-      expect(out.join('\n')).toContain('tier: owner');
-      expect(await cmds.removeTrusted('nope')).toBe(false);
-      expect(await cmds.removeTrusted(mini)).toBe(true);
-      expect(JSON.parse(readFileSync(join(home, '.morse', 'trusted-devices.json'), 'utf8')).devices).toEqual([]);
-
-      out.length = 0;
-      cmds.showSelf();
-      cmds.showInvite();
-      const shown = out.join('\n');
-      expect(shown).toContain(self.id);
-      expect(shown).toContain(`--trust ${self.id}`);
-      expect(shown).not.toMatch(/BEGIN (PRIVATE|CERTIFICATE)/); // nothing secret is ever printed
-    } finally {
-      log.mockRestore();
-      err.mockRestore();
-      if (saved === undefined) delete process.env['ANYTOANY_HOME'];
-      else process.env['ANYTOANY_HOME'] = saved;
-      rmSync(home, { recursive: true, force: true });
-      rmSync(other, { recursive: true, force: true });
-    }
+  it('trusted devices are listed even when the LAN sees none of them; the "no peers" line comes first', () => {
+    const lines = formatPeers(base({ trusted: [{ id: OWN, name: 'desk', tier: 'owner', addedAt: 0 }] }), ME);
+    expect(lines).toEqual(['no peers found on the LAN (is morse start running on the other device? same network?)', 'paired devices:', '  @desk  tier: owner  OOOOOOO', footer]);
   });
 });

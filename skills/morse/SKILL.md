@@ -107,7 +107,7 @@ When a `[Morse]` (or legacy `[anytoany]`) message asks you to DO something, the 
 
 This status line is protocol, not chatter — it is required even when an earlier thread said "no more replies". For real multi-step work, do one chunk you can finish in this turn and say in your reply what is done and what is next.
 
-## Anti-chatter rules (important)
+## Keep it quiet — anti-chatter (important)
 
 - **Only send when you have new information, a question, or a concrete request.** Never send acknowledgement-only or status-sync messages — they trigger reply loops between agents.
 - When a message says no reply is needed, or a thread's purpose is fulfilled: **stop.** Not replying is a valid and often correct response.

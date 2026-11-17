@@ -1,158 +1,180 @@
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { SessionInfo } from '../adapters/types.js';
 import type { SessionRef } from '../mailbox/mailbox.js';
 import { formatRelativeTime } from '../format.js';
 
-const PREFIX = 'morse-';
-/** Compatibility: earlier releases (as anytoany) wrote `any-<agent>-<slug>.md`; recognised by the signature below and removed on sync. */
-const LEGACY_PREFIX = 'any-';
-const SIGNATURE = 'You are a delivery proxy for the Morse session-messaging system.';
-const LEGACY_SIGNATURE = 'You are a delivery proxy for the anytoany session-messaging system.';
-const DEFAULT_MAX_PER_AGENT = 8;
+/**
+ * @-mention agents for Claude Code (Phase 2.5, ADR-064): every recent non-Claude session becomes a
+ * small agent definition in ~/.claude/agents/, `morse-<agent>-<project>.md`, whose only job is to
+ * relay a message to that one session with `morse send`.
+ *
+ * Ownership is strict. A file counts as generated only when its name has our prefix AND its body
+ * contains the marker sentence below; only such files are rewritten or deleted, so a user's own
+ * `morse-notes.md` stays untouched. Files that releases named anytoany wrote (`any-*.md`, with the
+ * old marker) are recognised the same way and cleaned up.
+ */
+
+const FILE_PREFIX = 'morse-';
+const MARKER = 'You are a delivery proxy for the Morse session-messaging system.';
+/** Compatibility: the prefix and marker of the files written by releases under the anytoany name. */
+const OLD_FILE_PREFIX = 'any-';
+const OLD_MARKER = 'You are a delivery proxy for the anytoany session-messaging system.';
 
 export interface SyncAgentsOptions {
+  /** Where the agent files go (default ~/.claude/agents). */
   agentsDir?: string;
+  /** Most recent sessions kept per agent kind (default 8); conversation partners are kept beyond it. */
   maxPerAgent?: number;
 }
 
 export interface SyncResult {
+  /** File names created or changed by this run. */
   written: string[];
+  /** Generated file names deleted by this run. */
   removed: string[];
 }
 
+/** Two ends of a conversation (as the mailbox lists them). */
 interface ConversationPair {
   a: SessionRef;
   b: SessionRef;
 }
 
-const asciiSlug = (text: string): string =>
-  text
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40);
+/** Scratch locations (smoke runs, experiments): their sessions are not worth a mention. */
+const SCRATCH_DIRS = ['/tmp/', '/private/tmp/', '/var/folders/'];
+const inScratch = (cwd: string): boolean => cwd === '' || SCRATCH_DIRS.some((dir) => cwd.startsWith(dir));
 
-function slugFor(session: SessionInfo): string {
-  const base = asciiSlug(basename(session.cwd)) || asciiSlug(session.title) || session.sessionId.slice(0, 8);
-  const device = session.device ? `${asciiSlug(session.device)}-` : '';
-  return `${PREFIX}${device}${session.agent}-${base}`;
+/** Lower-case ASCII words joined by dashes, cut at 40 characters (the cut may end on a dash). */
+function slug(text: string): string {
+  const words = text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return words.join('-').slice(0, 40);
 }
 
-const targetFor = (s: SessionInfo): string =>
-  s.device ? `@${s.device}/${s.agent}:${s.sessionId}` : `@${s.agent}:${s.sessionId}`;
-
-function renderAgentFile(name: string, s: SessionInfo): string {
-  const where = s.device ? `device "${s.device}", ` : '';
-  return `---
-name: ${name}
-description: Message the ${s.agent} session "${s.title}" (${where}${s.cwd}). Delivers to that exact ${s.agent} session via Morse; use when the user @-mentions this agent to relay a message. Active ${formatRelativeTime(s.lastActiveAt)}.
-tools: Bash
-model: haiku
----
-
-${SIGNATURE} Your ONLY job is to relay the user's message to one exact session and report the outcome. Never do anything else.
-
-**Fixed target (pre-bound, user-confirmed by selecting this agent — NEVER change it):**
-\`${targetFor(s)}\` — ${s.agent} session "${s.title}" in ${s.cwd}
-
-Steps:
-
-1. Identify the sender: run \`morse list --json --limit 0\` and pick the claude session whose \`cwd\` equals the current working directory, most recently active. Use its id as FROM. If none matches, use the most recently active claude session.
-2. Send exactly the user's message (verbatim — do not rewrite, summarize, or expand):
-   \`morse send "${targetFor(s)}" "<user message verbatim>" --from "@claude:<FROM id prefix>"\`
-3. Report back in one short line: the queued message id and that the reply will arrive back automatically via Morse.
-
-Rules:
-- NEVER resolve or guess a different target than the fixed one above.
-- Never add instructions of your own to the relayed message.
-- If \`morse\` fails, report the exact error verbatim — retry at most once, never work around it.
-`;
+/** morse-[<device>-]<agent>-<project folder | title | id prefix> */
+function baseName(s: SessionInfo): string {
+  const label = slug(basename(s.cwd)) || slug(s.title) || s.sessionId.slice(0, 8);
+  return [FILE_PREFIX, s.device ? `${slug(s.device)}-` : '', `${s.agent}-`, label].join('');
 }
 
-/**
- * A file is ours only when BOTH its name has our prefix (`morse-`, or the legacy
- * `any-`) AND its body carries the generator's signature line — a user's own
- * `morse-notes.md` or `any-helper.md` is never overwritten or removed.
- */
-function isGenerated(path: string): boolean {
+/** The exact `morse send` target the agent is bound to. */
+function boundTarget(s: SessionInfo): string {
+  const who = `${s.agent}:${s.sessionId}`;
+  return s.device ? `@${s.device}/${who}` : `@${who}`;
+}
+
+function agentDefinition(name: string, s: SessionInfo): string {
+  const target = boundTarget(s);
+  const location = s.device ? `device "${s.device}", ${s.cwd}` : s.cwd;
+  const lines = [
+    '---',
+    `name: ${name}`,
+    `description: Message the ${s.agent} session "${s.title}" (${location}). Delivers to that exact ${s.agent} session via Morse; use when the user @-mentions this agent to relay a message. Active ${formatRelativeTime(s.lastActiveAt)}.`,
+    'tools: Bash',
+    'model: haiku',
+    '---',
+    '',
+    `${MARKER} Your ONLY job is to relay the user's message to one exact session and report the outcome. Never do anything else.`,
+    '',
+    '**Fixed target (pre-bound, user-confirmed by selecting this agent — NEVER change it):**',
+    `\`${target}\` — ${s.agent} session "${s.title}" in ${s.cwd}`,
+    '',
+    'Steps:',
+    '',
+    '1. Identify the sender: run `morse list --json --limit 0` and pick the claude session whose `cwd` equals the current working directory, most recently active. Use its id as FROM. If none matches, use the most recently active claude session.',
+    '2. Send exactly the user\'s message (verbatim — do not rewrite, summarize, or expand):',
+    `   \`morse send "${target}" "<user message verbatim>" --from "@claude:<FROM id prefix>"\``,
+    '3. Report back in one short line: the queued message id and that the reply will arrive back automatically via Morse.',
+    '',
+    'Rules:',
+    '- NEVER resolve or guess a different target than the fixed one above.',
+    '- Never add instructions of your own to the relayed message.',
+    '- If `morse` fails, report the exact error verbatim — retry at most once, never work around it.',
+    '',
+  ];
+  return lines.join('\n');
+}
+
+/** Ours = one of our prefixes AND one of our markers in the body. */
+function isOurs(dir: string, file: string): boolean {
+  if (!file.startsWith(FILE_PREFIX) && !file.startsWith(OLD_FILE_PREFIX)) return false;
+  let body: string;
   try {
-    const body = readFileSync(path, 'utf8');
-    return body.includes(SIGNATURE) || body.includes(LEGACY_SIGNATURE);
+    body = readFileSync(join(dir, file), 'utf8');
   } catch {
     return false;
   }
+  return body.includes(MARKER) || body.includes(OLD_MARKER);
 }
 
+/** The "Active 3h ago." phrase changes by itself; it alone is no reason to rewrite a file. */
+const withoutAge = (text: string): string => text.replace(/Active [^.]*\./g, '');
+
 /**
- * Materialize addressable peer sessions as @-mentionable agent definitions
- * (Phase 2.5; ADR-064). Only files this generator wrote (prefix + signature,
- * see isGenerated) are ever updated or removed — user-authored agents are
- * untouchable. Legacy `any-*.md` files it wrote are removed.
+ * Which sessions get an agent: per agent kind the `max` most recent, plus every session that is
+ * part of a conversation — newest first, kinds in the order they first appear.
  */
+function pickSessions(sessions: SessionInfo[], conversations: ConversationPair[], max: number): SessionInfo[] {
+  const partners = new Set<string>();
+  for (const { a, b } of conversations) for (const ref of [a, b]) if (ref.agent !== 'claude') partners.add(ref.sessionId);
+
+  const newestFirst = sessions
+    .filter((s) => s.agent !== 'claude' && !inScratch(s.cwd))
+    .sort((x, y) => y.lastActiveAt - x.lastActiveAt);
+  const kindOrder = new Map<string, number>();
+  const seenPerKind = new Map<string, number>();
+  const picked = new Map<string, { session: SessionInfo; kind: number; rank: number }>();
+  newestFirst.forEach((session, position) => {
+    if (!kindOrder.has(session.agent)) kindOrder.set(session.agent, kindOrder.size);
+    const nth = seenPerKind.get(session.agent) ?? 0;
+    seenPerKind.set(session.agent, nth + 1);
+    if (nth >= max && !partners.has(session.sessionId)) return;
+    const earlier = picked.get(session.sessionId);
+    const kind = kindOrder.get(session.agent)!;
+    // one entry per session id: the last one seen wins, at the place of the first
+    picked.set(session.sessionId, earlier ? { ...earlier, session } : { session, kind, rank: position });
+  });
+  return [...picked.values()]
+    .sort((x, y) => y.session.lastActiveAt - x.session.lastActiveAt || x.kind - y.kind || x.rank - y.rank)
+    .map((p) => p.session);
+}
+
+/** Bring ~/.claude/agents in line with the current sessions; see the header for what is touched. */
 export async function syncMentionAgents(
   sessions: SessionInfo[],
   conversations: ConversationPair[],
   options: SyncAgentsOptions = {},
 ): Promise<SyncResult> {
-  const agentsDir = options.agentsDir ?? join(homedir(), '.claude', 'agents');
-  const maxPerAgent = options.maxPerAgent ?? DEFAULT_MAX_PER_AGENT;
-  mkdirSync(agentsDir, { recursive: true });
+  const dir = options.agentsDir ?? join(homedir(), '.claude', 'agents');
+  mkdirSync(dir, { recursive: true });
 
-  // temp-dir sessions (smoke tests, scratch experiments) must not pollute the mention list
-  const isTemp = (cwd: string): boolean =>
-    cwd.startsWith('/tmp/') || cwd.startsWith('/private/tmp/') || cwd.startsWith('/var/folders/') || cwd === '';
-  const candidates = sessions.filter((s) => s.agent !== 'claude' && !isTemp(s.cwd));
-  const partnerIds = new Set(
-    conversations.flatMap((c) => [c.a, c.b]).filter((r) => r.agent !== 'claude').map((r) => r.sessionId),
-  );
-
-  const byKind = new Map<string, SessionInfo[]>();
-  for (const s of [...candidates].sort((a, b) => b.lastActiveAt - a.lastActiveAt)) {
-    const list = byKind.get(s.agent) ?? [];
-    list.push(s);
-    byKind.set(s.agent, list);
-  }
-  const selected = new Map<string, SessionInfo>();
-  for (const list of byKind.values()) {
-    for (const [i, s] of list.entries()) {
-      if (i < maxPerAgent || partnerIds.has(s.sessionId)) selected.set(s.sessionId, s);
-    }
+  // file name → session; a second session with the same name gets the first 4 characters of its id appended
+  const files = new Map<string, SessionInfo>();
+  for (const s of pickSessions(sessions, conversations, options.maxPerAgent ?? 8)) {
+    const base = baseName(s);
+    files.set(files.has(`${base}.md`) ? `${base}-${s.sessionId.slice(0, 4)}.md` : `${base}.md`, s);
   }
 
-  // assign unique names (id suffix on collision), newest first for stable prefixes
-  const names = new Map<string, SessionInfo>();
-  for (const s of [...selected.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt)) {
-    const base = slugFor(s);
-    const name = names.has(base) ? `${base}-${s.sessionId.slice(0, 4)}` : base;
-    names.set(name, s);
-  }
-
-  const written: string[] = [];
-  const wanted = new Set<string>();
-  for (const [name, session] of names) {
-    const file = `${name}.md`;
-    wanted.add(file);
-    const path = join(agentsDir, file);
-    const content = renderAgentFile(name, session);
-    const existing = existsSync(path) ? readFileSync(path, 'utf8') : null;
-    if (existing !== null && !isGenerated(path)) continue; // a user's own file with this name
-    // strip the volatile relative-time phrase before comparing to stay idempotent
-    const stable = (t: string) => t.replace(/Active [^.]*\./g, '');
-    if (existing === null || stable(existing) !== stable(content)) {
+  const result: SyncResult = { written: [], removed: [] };
+  for (const [file, session] of files) {
+    const path = join(dir, file);
+    const content = agentDefinition(file.slice(0, -'.md'.length), session);
+    if (!existsSync(path)) {
       writeFileSync(path, content, 'utf8');
-      written.push(file);
+      result.written.push(file);
+      continue;
     }
+    if (!isOurs(dir, file)) continue; // the user's own file under that name
+    if (withoutAge(readFileSync(path, 'utf8')) === withoutAge(content)) continue;
+    writeFileSync(path, content, 'utf8');
+    result.written.push(file);
   }
 
-  const removed: string[] = [];
-  for (const file of readdirSync(agentsDir)) {
-    const prefixed = file.startsWith(PREFIX) || file.startsWith(LEGACY_PREFIX);
-    if (prefixed && file.endsWith('.md') && !wanted.has(file) && isGenerated(join(agentsDir, file))) {
-      rmSync(join(agentsDir, file));
-      removed.push(file);
-    }
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith('.md') || files.has(file) || !isOurs(dir, file)) continue;
+    rmSync(join(dir, file));
+    result.removed.push(file);
   }
-  return { written, removed };
+  return result;
 }

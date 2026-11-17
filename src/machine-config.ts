@@ -5,13 +5,15 @@ import { withFileLock, writeFileAtomic } from './file-lock.js';
 import { morseHome, dataDir } from './home.js';
 
 /**
- * Per-machine delivery policy (~/.morse/config.json) — the machine OWNER's
- * explicit escalation choices for headless turns woken by Morse. Never
- * controlled by the sending agent. Read per delivery so edits apply without
- * a daemon restart.
+ * ~/.morse/config.json: settings the OWNER of this computer chose for it. Nothing a sending agent says can
+ * change them — in particular the escalation a headless turn woken by Morse may use (`zcode.deliverMode`,
+ * `codex.sandbox`) is only ever what is written here. Callers read it again each time (per delivery), so an
+ * edit takes effect without restarting the daemon.
  */
 export interface MachineConfig {
+  /** ZCode delivery: how a woken turn runs (see src/adapters/zcode.ts) and how long it may take. */
   zcode?: { deliverMode?: string; deliverTimeoutSec?: number };
+  /** Codex delivery: the sandbox of `codex exec resume` and how long a turn may take. */
   codex?: { sandbox?: string; deliverTimeoutSec?: number };
   /** Morse cross-network relay, e.g. { "url": "wss://relay.morse.im" }; `handle`
    *  is this device's person on it, written by `morse join` (display only — the
@@ -63,17 +65,23 @@ export interface MachineConfig {
   hooks?: { on_message?: { command?: string; timeoutSec?: number } };
 }
 
-export function defaultConfigFile(): string {
-  return join(dataDir(), 'config.json');
+/** Where this computer's config lives: config.json in the data directory. */
+export function defaultConfigFile(): string { return join(dataDir(), 'config.json'); }
+
+/** The JSON object in `file`; null when the file is missing, unreadable, not JSON, or not an object. */
+function readJsonObject(file: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
 }
 
+/** The config as it is on disk; `{}` (every default) when there is none or it cannot be read. */
 export function readMachineConfig(file: string = defaultConfigFile()): MachineConfig {
-  try {
-    const raw = JSON.parse(readFileSync(file, 'utf8')) as MachineConfig;
-    return typeof raw === 'object' && raw !== null ? raw : {};
-  } catch {
-    return {}; // no config / unreadable — safe defaults everywhere
-  }
+  return (readJsonObject(file) ?? {}) as MachineConfig;
 }
 
 /**
@@ -84,13 +92,7 @@ export function readMachineConfig(file: string = defaultConfigFile()): MachineCo
  */
 export function updateMachineConfig(mutate: (cfg: Record<string, unknown>) => void, file: string = defaultConfigFile()): void {
   withFileLock(file, () => {
-    let cfg: Record<string, unknown> = {};
-    try {
-      const raw = JSON.parse(readFileSync(file, 'utf8')) as unknown;
-      if (raw && typeof raw === 'object' && !Array.isArray(raw)) cfg = raw as Record<string, unknown>;
-    } catch {
-      /* no config yet */
-    }
+    const cfg = readJsonObject(file) ?? {};
     mutate(cfg);
     writeFileAtomic(file, `${JSON.stringify(cfg, null, 2)}\n`);
   });

@@ -1,134 +1,157 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { SessionInfo } from '../src/adapters/types.js';
 import { syncMentionAgents } from '../src/cluster/sync-agents.js';
 
-const s = (over: Partial<SessionInfo>): SessionInfo => ({
-  agent: 'codex',
-  sessionId: '019f4823-74af-7510-8daa-bb7cb0450a77',
-  title: 'mobile app dev',
-  cwd: '/Users/alex/projects/mobile-app',
-  lastActiveAt: 1000,
+let dir = '';
+afterEach(() => {
+  if (dir) rmSync(dir, { recursive: true, force: true });
+  dir = '';
+});
+const agentsDir = (): string => (dir = mkdtempSync(join(tmpdir(), 'morse-mention-')));
+const files = (): string[] => readdirSync(dir).sort();
+const body = (file: string): string => readFileSync(join(dir, file), 'utf8');
+
+let seq = 0;
+const session = (over: Partial<SessionInfo> = {}): SessionInfo => ({
+  agent: 'kimi',
+  sessionId: `5e55${String(++seq).padStart(4, '0')}-1111-4222-8333-444455556666`,
+  title: 'Billing API',
+  cwd: '/Users/alex/code/billing-api',
+  lastActiveAt: 50_000,
   ...over,
 });
 
-let dir: string;
-const setup = () => {
-  dir = mkdtempSync(join(tmpdir(), 'anytoany-agents-'));
-  return dir;
-};
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
-describe('syncMentionAgents', () => {
-  it('materializes non-claude sessions as morse- prefixed agent files with exact ids', async () => {
-    const agentsDir = setup();
-    const { written } = await syncMentionAgents(
-      [s({}), s({ agent: 'claude', sessionId: 'aaaa1111-0000-4000-8000-000000000001', title: 'x' })],
-      [],
-      { agentsDir },
-    );
-    expect(written).toHaveLength(1); // claude sessions are not materialized
-    const files = readdirSync(agentsDir);
-    expect(files).toEqual(['morse-codex-mobile-app.md']);
-    const body = readFileSync(join(agentsDir, files[0]!), 'utf8');
-    expect(body).toContain('name: morse-codex-mobile-app');
-    expect(body).toContain('@codex:019f4823-74af-7510-8daa-bb7cb0450a77'); // pre-bound exact id
-    expect(body).toContain('tools: Bash');
-    expect(body).toContain('model: haiku');
-    expect(body).toContain('via Morse');
-    expect(body).toContain('morse send "@codex:019f4823-74af-7510-8daa-bb7cb0450a77"');
-    expect(body).not.toMatch(/anytoany|anyd /);
-  });
-
-  it('excludes temp-dir sessions (smoke leftovers) from the mention list', async () => {
-    const agentsDir = setup();
-    const { written } = await syncMentionAgents(
+describe('syncMentionAgents: which sessions get an agent', () => {
+  it('every non-Claude session outside scratch folders, named after its folder', async () => {
+    const d = agentsDir();
+    const keep = session();
+    const r = await syncMentionAgents(
       [
-        s({}),
-        s({ sessionId: '019f9999-0000-7000-8000-000000000009', cwd: '/private/tmp/anytoany-smoke.abcd', title: 'smoke' }),
-        s({ sessionId: '019f9998-0000-7000-8000-000000000008', cwd: '/tmp/x', title: 'tmp' }),
+        keep,
+        session({ agent: 'claude', cwd: '/Users/alex/code/web' }),
+        session({ cwd: '/tmp/smoke-1' }),
+        session({ cwd: '/private/tmp/x' }),
+        session({ cwd: '/var/folders/zz/T/run' }),
+        session({ cwd: '' }),
       ],
       [],
-      { agentsDir },
+      { agentsDir: d },
     );
-    expect(written).toHaveLength(1);
-    expect(readdirSync(agentsDir)).toEqual(['morse-codex-mobile-app.md']);
+    expect(r).toEqual({ written: ['morse-kimi-billing-api.md'], removed: [] });
+    expect(files()).toEqual(['morse-kimi-billing-api.md']);
+    expect(body('morse-kimi-billing-api.md')).toContain(`@kimi:${keep.sessionId}`);
   });
 
-  it('includes device prefix for remote sessions', async () => {
-    const agentsDir = setup();
-    await syncMentionAgents([s({ device: 'mini', sessionId: '019f0000-0000-7000-8000-000000000001' })], [], { agentsDir });
-    const files = readdirSync(agentsDir);
-    expect(files).toEqual(['morse-mini-codex-mobile-app.md']);
-    expect(readFileSync(join(agentsDir, files[0]!), 'utf8')).toContain('@mini/codex:019f0000');
+  it('falls back from the folder to the title, then to the first 8 characters of the id', async () => {
+    const d = agentsDir();
+    const titled = session({ cwd: '/', title: 'Release — Notes!' });
+    const bare = session({ agent: 'codex', cwd: '/', title: '***' });
+    await syncMentionAgents([titled, bare], [], { agentsDir: d });
+    expect(files()).toEqual([`morse-codex-${bare.sessionId.slice(0, 8)}.md`, 'morse-kimi-release-notes.md']);
   });
 
-  it('caps per agent kind by recency but always keeps conversation partners', async () => {
-    const agentsDir = setup();
-    const many = Array.from({ length: 12 }, (_, i) =>
-      s({ sessionId: `019f00${String(i).padStart(2, '0')}-0000-7000-8000-000000000001`, title: `proj${i}`, cwd: `/w/proj${i}`, lastActiveAt: i }),
+  it('puts the device in the name and the target for a session on another device', async () => {
+    const d = agentsDir();
+    const remote = session({ device: 'Air M2' });
+    await syncMentionAgents([remote], [], { agentsDir: d });
+    expect(files()).toEqual(['morse-air-m2-kimi-billing-api.md']);
+    expect(body('morse-air-m2-kimi-billing-api.md')).toContain(`morse send "@Air M2/kimi:${remote.sessionId}"`);
+  });
+
+  it('keeps the newest N per agent kind, plus any session that is in a conversation', async () => {
+    const d = agentsDir();
+    const kimis = Array.from({ length: 6 }, (_, i) => session({ cwd: `/w/k${i}`, lastActiveAt: i }));
+    const codexes = Array.from({ length: 3 }, (_, i) => session({ agent: 'codex', cwd: `/w/c${i}`, lastActiveAt: 100 + i }));
+    const r = await syncMentionAgents(
+      [...kimis, ...codexes],
+      [{ a: { agent: 'claude', sessionId: 'me' }, b: { agent: 'kimi', sessionId: kimis[0]!.sessionId } }],
+      { agentsDir: d, maxPerAgent: 2 },
     );
-    const partner = many[0]!; // oldest — would be cut by the cap
-    const { written } = await syncMentionAgents(
-      many,
-      [{ a: { agent: 'claude', sessionId: 'c1' }, b: { agent: partner.agent, sessionId: partner.sessionId } }],
-      { agentsDir, maxPerAgent: 5 },
-    );
-    expect(written.length).toBe(6); // top 5 + 1 conversation partner
-    expect(readdirSync(agentsDir).some((f) => f.includes('proj0'))).toBe(true);
+    // newest first across kinds
+    expect(r.written).toEqual(['morse-codex-c2.md', 'morse-codex-c1.md', 'morse-kimi-k5.md', 'morse-kimi-k4.md', 'morse-kimi-k0.md']);
   });
 
-  it('is idempotent, removes its own stale files, never touches user files', async () => {
-    const agentsDir = setup();
-    writeFileSync(join(agentsDir, 'my-reviewer.md'), 'user file');
-    await syncMentionAgents([s({ sessionId: '019f7777-0000-7000-8000-000000000007', cwd: '/w/gone' })], [], { agentsDir });
-    expect(readdirSync(agentsDir)).toContain('morse-codex-gone.md');
-
-    const first = await syncMentionAgents([s({})], [], { agentsDir });
-    expect(first.removed).toEqual(['morse-codex-gone.md']);
-    const second = await syncMentionAgents([s({})], [], { agentsDir });
-    expect(second.written).toHaveLength(0); // unchanged content not rewritten
-    expect(readFileSync(join(agentsDir, 'my-reviewer.md'), 'utf8')).toBe('user file');
+  it('defaults to 8 per kind', async () => {
+    const d = agentsDir();
+    await syncMentionAgents(Array.from({ length: 10 }, (_, i) => session({ cwd: `/w/p${i}`, lastActiveAt: i })), [], { agentsDir: d });
+    expect(files()).toHaveLength(8);
+    expect(files()).not.toContain('morse-kimi-p0.md');
   });
 
-  it('removes the legacy any-*.md files it generated (anytoany signature), and only those', async () => {
-    const agentsDir = setup();
-    const legacy = `---\nname: any-codex-old\ndescription: Message the codex session "old" (/w/old). Delivers to that exact codex session via anytoany; use when the user @-mentions this agent to relay a message. Active 2d ago.\ntools: Bash\nmodel: haiku\n---\n\nYou are a delivery proxy for the anytoany session-messaging system. Your ONLY job is to relay the user's message to one exact session and report the outcome. Never do anything else.\n`;
-    writeFileSync(join(agentsDir, 'any-codex-old.md'), legacy);
-    writeFileSync(join(agentsDir, 'any-codex-mobile-app.md'), legacy.replace(/old/g, 'mobile-app'));
-    writeFileSync(join(agentsDir, 'any-helper.md'), 'my own agent that happens to start with any-');
-    writeFileSync(join(agentsDir, 'morse-notes.md'), 'my own agent that happens to start with morse-');
-
-    const { removed } = await syncMentionAgents([s({})], [], { agentsDir });
-    expect(removed.sort()).toEqual(['any-codex-mobile-app.md', 'any-codex-old.md']);
-    expect(readdirSync(agentsDir).sort()).toEqual(['any-helper.md', 'morse-codex-mobile-app.md', 'morse-notes.md']);
-    expect(readFileSync(join(agentsDir, 'any-helper.md'), 'utf8')).toBe('my own agent that happens to start with any-');
-    expect(readFileSync(join(agentsDir, 'morse-notes.md'), 'utf8')).toBe('my own agent that happens to start with morse-');
+  it('a second session with the same name gets 4 characters of its id appended (the newer one keeps the plain name)', async () => {
+    const d = agentsDir();
+    const older = session({ lastActiveAt: 1 });
+    const newer = session({ lastActiveAt: 2 });
+    await syncMentionAgents([older, newer], [], { agentsDir: d });
+    expect(body('morse-kimi-billing-api.md')).toContain(newer.sessionId);
+    expect(body(`morse-kimi-billing-api-${older.sessionId.slice(0, 4)}.md`)).toContain(older.sessionId);
   });
+});
 
-  it('never overwrites a user file that has the name it would generate', async () => {
-    const agentsDir = setup();
-    writeFileSync(join(agentsDir, 'morse-codex-mobile-app.md'), 'hand-written');
-    const { written, removed } = await syncMentionAgents([s({})], [], { agentsDir });
-    expect(written).toEqual([]);
-    expect(removed).toEqual([]);
-    expect(readFileSync(join(agentsDir, 'morse-codex-mobile-app.md'), 'utf8')).toBe('hand-written');
-  });
-
-  it('disambiguates name collisions with an id suffix', async () => {
-    const agentsDir = setup();
+describe('syncMentionAgents: the file', () => {
+  it('is exactly the pinned agent definition (only the "Active …" age varies)', async () => {
+    const d = agentsDir();
     await syncMentionAgents(
-      [
-        s({ sessionId: '019f0001-0000-7000-8000-000000000001' }),
-        s({ sessionId: '019f0002-0000-7000-8000-000000000002', lastActiveAt: 2000 }),
-      ],
+      [{ agent: 'codex', sessionId: 'aaaa0000-1', title: 'mobile app dev', cwd: '/Users/alex/projects/mobile-app', lastActiveAt: Date.now() - 3 * 3600_000, device: 'Mini Box' }],
       [],
-      { agentsDir },
+      { agentsDir: d },
     );
-    const files = readdirSync(agentsDir).sort();
-    expect(files).toHaveLength(2);
-    expect(new Set(files).size).toBe(2);
+    const text = body('morse-mini-box-codex-mobile-app.md');
+    expect(text).toMatch(/ Active 3h ago\.\n/);
+    expect(text.replace(/Active [^.]*\./, 'Active X.')).toBe(readFileSync(join(import.meta.dirname, 'fixtures', 'mention-agent.md'), 'utf8'));
+  });
+
+  it('local sessions have no device part', async () => {
+    const d = agentsDir();
+    const s = session();
+    await syncMentionAgents([s], [], { agentsDir: d });
+    const text = body('morse-kimi-billing-api.md');
+    expect(text).toContain(`(${s.cwd}). Delivers to that exact kimi session via Morse;`);
+    expect(text).toContain(`\`@kimi:${s.sessionId}\` — kimi session "Billing API" in ${s.cwd}`);
+    expect(text).not.toContain('device "');
+  });
+});
+
+describe('syncMentionAgents: what it may touch', () => {
+  it('does not rewrite a file whose only change is the age phrase', async () => {
+    const d = agentsDir();
+    const s = session({ lastActiveAt: Date.now() - 60_000 });
+    expect((await syncMentionAgents([s], [], { agentsDir: d })).written).toHaveLength(1);
+    expect((await syncMentionAgents([{ ...s, lastActiveAt: Date.now() - 7200_000 }], [], { agentsDir: d })).written).toEqual([]);
+    expect((await syncMentionAgents([{ ...s, title: 'Renamed' }], [], { agentsDir: d })).written).toEqual(['morse-kimi-billing-api.md']);
+    expect(body('morse-kimi-billing-api.md')).toContain('"Renamed"');
+  });
+
+  it('removes its own files that are no longer wanted, old any-*.md ones included, and nothing else', async () => {
+    const d = agentsDir();
+    const gone = session({ cwd: '/w/gone' });
+    await syncMentionAgents([gone], [], { agentsDir: d });
+    const oldStyle = 'name: any-codex-x\n---\n\nYou are a delivery proxy for the anytoany session-messaging system. Relay.\n';
+    writeFileSync(join(d, 'any-codex-x.md'), oldStyle);
+    writeFileSync(join(d, 'any-mine.md'), 'mine');
+    writeFileSync(join(d, 'morse-mine.md'), 'mine too');
+    writeFileSync(join(d, 'reviewer.md'), 'You are a delivery proxy for the Morse session-messaging system.'); // marker, but not our prefix
+    writeFileSync(join(d, 'morse-keep.txt'), 'You are a delivery proxy for the Morse session-messaging system.'); // not .md
+
+    const r = await syncMentionAgents([session()], [], { agentsDir: d });
+    expect(r.removed.sort()).toEqual(['any-codex-x.md', 'morse-kimi-gone.md']);
+    expect(files()).toEqual(['any-mine.md', 'morse-keep.txt', 'morse-kimi-billing-api.md', 'morse-mine.md', 'reviewer.md']);
+  });
+
+  it('leaves a user\'s own file that happens to have the generated name, and does not count it', async () => {
+    const d = agentsDir();
+    writeFileSync(join(d, 'morse-kimi-billing-api.md'), 'written by hand');
+    expect(await syncMentionAgents([session()], [], { agentsDir: d })).toEqual({ written: [], removed: [] });
+    expect(body('morse-kimi-billing-api.md')).toBe('written by hand');
+  });
+
+  it('creates the agents folder when it does not exist', async () => {
+    const parent = agentsDir();
+    const nested = join(parent, 'a', 'b');
+    await syncMentionAgents([session()], [], { agentsDir: nested });
+    expect(existsSync(join(nested, 'morse-kimi-billing-api.md'))).toBe(true);
   });
 });

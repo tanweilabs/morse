@@ -1,23 +1,25 @@
 import { defineConfig } from 'vitest/config';
 
+/** Where the test files are: the client, the relay (public since ADR-092), and the repo tooling under scripts/. */
+const suites = ['test/**/*.test.ts', 'relay-cf/test/**/*.test.ts', 'scripts/test/**/*.test.ts'];
+
+/**
+ * Not held to the coverage bar: command wiring (cli.ts) and the thin shells that only make sense
+ * against real agent CLIs on a real machine (exec.ts runs them, doctor.ts inspects them).
+ */
+const outsideCoverage = ['src/cli.ts', 'src/adapters/exec.ts', 'src/doctor.ts'];
+
 export default defineConfig({
   test: {
-    // every test process gets a throw-away MORSE_HOME unless it sets one: tests never touch the real ~/.morse
+    include: suites,
+    // Runs first in every worker: points MORSE_HOME at a fresh temp dir unless the test set one,
+    // so no test can read or write the real ~/.morse.
     setupFiles: ['test/helpers/isolate-home.ts'],
-    // test/ is the client, relay-cf/test the relay (public since ADR-092), scripts/test the
-    // relay tooling (public) and the release tooling (private: not in the public export).
-    include: ['test/**/*.test.ts', 'relay-cf/test/**/*.test.ts', 'scripts/test/**/*.test.ts'],
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
-      // cli is command wiring; exec/doctor are thin diagnostic shells exercised
-      // for real by scripts/smoke.sh — excluded from unit thresholds
-      exclude: ['src/cli.ts', 'src/adapters/exec.ts', 'src/doctor.ts'],
-      thresholds: {
-        lines: 80,
-        functions: 80,
-        branches: 80,
-      },
+      exclude: outsideCoverage,
+      thresholds: { lines: 80, functions: 80, branches: 80 },
     },
   },
 });

@@ -4,25 +4,30 @@ about: Something broke — delivery failed, sessions missing, console misbehavin
 labels: bug
 ---
 
-**What happened**
+## What went wrong
 
-**What you expected**
+<!-- What did you do, what did Morse do? -->
 
-**Repro steps**
+## What should have happened
+
+## How to make it happen again
 
 1.
 2.
+3.
 
-**Environment**
+## Your setup
 
-- OS / version:
-- Node version:
-- `morse status --check` output:
-- Agents involved (claude / codex / …) and versions:
+- Operating system and version:
+- `node -v`:
+- Agents involved, with versions (Claude Code, Codex, Kimi, …):
+- Output of `morse status --check`:
 
-**Relevant output**
+## Output and logs
+
+<!-- Paste `morse status`, and the daemon log (~/.morse/daemon.log) around the time it failed.
+     Remove anything private first: message text, addresses you don't want to share, paths. -->
 
 ```
-anyd status
-# and the daemon log lines around the failure, if any
+morse status
 ```

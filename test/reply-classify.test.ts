@@ -1,73 +1,65 @@
-import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
 import { classifyReply } from '../src/envelope.js';
+import { dataDir } from '../src/home.js';
+import { createDb } from '../src/mailbox/db.js';
+import { createMailbox } from '../src/mailbox/mailbox.js';
 
-// ADR-032: one rule for "should this reply be filed", shared by the stdout-marker
-// path (dispatcher) and the command path (`morse reply`, used by Codex Desktop's queue).
+// ADR-032: whether an agent's reply becomes a message — one rule for the stdout marker (the dispatcher) and for
+// `morse reply` / `anyd reply` (what an agent in Codex Desktop's queue runs).
 describe('classifyReply', () => {
-  it('files a substantive reply', () => {
-    expect(classifyReply('please run the tests', 'DONE all 12 pass')).toBe('file');
+  it('a reply with content is filed', () => {
+    expect(classifyReply('deploy the docs', 'DONE docs deployed')).toBe('file');
+    expect(classifyReply('', '')).toBe('file');
   });
 
-  it('drops a bare NOOP — the "nothing new to add" escape hatch', () => {
-    expect(classifyReply('DONE pushed abc123', 'NOOP')).toBe('noop');
+  it('NOOP as the first word drops it — alone, after blanks, or with words after it', () => {
+    for (const reply of ['NOOP', '   NOOP', '\nNOOP\n', 'NOOP — nothing to add', 'NOOP\tok']) expect(classifyReply('DONE shipped', reply), JSON.stringify(reply)).toBe('noop');
   });
 
-  it('drops NOOP with leading whitespace or prose after it', () => {
-    expect(classifyReply('DONE pushed', '  NOOP')).toBe('noop');
-    expect(classifyReply('DONE pushed', 'NOOP\n---\nstanding by')).toBe('noop');
+  it('only the word itself: NOOPS, noop or a later NOOP are content', () => {
+    for (const reply of ['NOOPS', 'noop', 'nothing new, NOOP']) expect(classifyReply('DONE shipped', reply), reply).toBe('file');
   });
 
-  it('does not mistake a NOOP-prefixed word for a noop verdict', () => {
-    expect(classifyReply('question?', 'NOOPETH is real content')).toBe('file');
+  it('BLOCKED answering BLOCKED is dropped (two waiting agents would confirm each other for ever)', () => {
+    expect(classifyReply('BLOCKED need the token', 'BLOCKED so do I')).toBe('blocked-pingpong');
+    expect(classifyReply('\n  BLOCKED waiting', '  BLOCKED same')).toBe('blocked-pingpong');
   });
 
-  it('suppresses BLOCKED answering BLOCKED', () => {
-    expect(classifyReply('BLOCKED waiting for user', 'BLOCKED same here')).toBe('blocked-pingpong');
-    expect(classifyReply('  BLOCKED waiting', '\nBLOCKED me too')).toBe('blocked-pingpong');
-  });
-
-  it('lets a substantive reply to a BLOCKED message through', () => {
-    expect(classifyReply('BLOCKED need the API key path', 'it is in ~/.config/x')).toBe('file');
+  it('…but anything else answering BLOCKED, or BLOCKED answering something else, is filed', () => {
+    expect(classifyReply('BLOCKED need the token', 'it is in the vault under ci/')).toBe('file');
+    expect(classifyReply('please check the build', 'BLOCKED no network here')).toBe('file');
   });
 });
 
-// End-to-end through the real CLI: the command path Codex Desktop uses (ADR-027).
-describe('morse reply (command path)', () => {
-  const run = async (home: string, id: string, text: string) => {
-    const { execFileSync } = await import('node:child_process');
-    return execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'reply', id, text], {
-      env: { ...process.env, MORSE_HOME: home },
-      encoding: 'utf8',
-    });
-  };
-  const setup = async () => {
-    const { mkdtempSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { dataDir } = await import('../src/home.js');
-    const { createDb } = await import('../src/mailbox/db.js');
-    const { createMailbox } = await import('../src/mailbox/mailbox.js');
+// The command path end to end, through the real CLI.
+describe('morse reply files a real reply and drops a NOOP', () => {
+  const homes: string[] = [];
+  afterAll(() => homes.forEach((h) => rmSync(h, { recursive: true, force: true })));
+
+  /** A home with one message from a Claude session to a Codex session, waiting for its reply. */
+  const homeWithMessage = () => {
     const home = mkdtempSync(join(tmpdir(), 'morse-reply-'));
+    homes.push(home);
     const mailbox = createMailbox(createDb(join(dataDir(home), 'mailbox.db')));
-    const m = mailbox.send({
-      from: { agent: 'claude', sessionId: 'c1' },
-      to: { agent: 'codex', sessionId: 'x1' },
-      text: 'DONE index updated',
-    });
-    return { home, mailbox, id: m.id };
+    const asked = mailbox.send({ from: { agent: 'claude', sessionId: 'cl-1' }, to: { agent: 'codex', sessionId: 'cx-1' }, text: 'DONE the index is rebuilt' });
+    return { home, mailbox, id: asked.id };
   };
+  const reply = (home: string, id: string, text: string): string =>
+    execFileSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'reply', id, text], { env: { ...process.env, MORSE_HOME: home }, encoding: 'utf8' });
 
-  it('does not file a NOOP — the other side is never woken', async () => {
-    const { home, mailbox, id } = await setup();
-    const out = await run(home, id, 'NOOP');
-    expect(out).toMatch(/no reply sent/);
-    expect(mailbox.inbox({ all: true })).toHaveLength(1);
-  }, 20000);
+  it('NOOP: nothing is filed, so the other side is never woken', () => {
+    const { home, mailbox, id } = homeWithMessage();
+    expect(reply(home, id, 'NOOP')).toMatch(/no reply sent/);
+    expect(mailbox.inbox({ all: true }).map((m) => m.id)).toEqual([id]);
+  }, 20_000);
 
-  it('still files a real reply', async () => {
-    const { home, mailbox, id } = await setup();
-    const out = await run(home, id, 'DONE thanks, card updated');
-    expect(out).toMatch(/queued reply/);
+  it('a real reply is queued as a message of its own', () => {
+    const { home, mailbox, id } = homeWithMessage();
+    expect(reply(home, id, 'DONE thanks, verified')).toMatch(/queued reply/);
     expect(mailbox.inbox({ all: true })).toHaveLength(2);
-  }, 20000);
+  }, 20_000);
 });

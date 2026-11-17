@@ -10,7 +10,7 @@ import { matchLaunch, parseLaunchConfig } from '../src/plugins/dispatch/launch.j
 /**
  * ADR-054: per-agent launch settings in the dispatch plugin — "this agent runs with
  * model X, effort Y, these permissions, this time limit" — config, not core. Bypass-style
- * permission modes are refused in code. Uses the fake-exec pattern of adapter-deliver.
+ * permission modes are refused in code. Uses a fake exec that records calls and returns a canned result.
  */
 
 const SID = 'aaaa1111-0000-4000-8000-000000000001';

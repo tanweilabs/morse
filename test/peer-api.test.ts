@@ -1,95 +1,126 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { SessionInfo } from '../src/adapters/types.js';
-import { loadOrCreateIdentity, type DeviceIdentity } from '../src/cluster/identity.js';
-import { createPeerApiHandler } from '../src/cluster/peer-api.js';
-import { peerRequest, startPeerServer, type PeerServer } from '../src/cluster/secure-transport.js';
-import { createTrustStore } from '../src/cluster/trust.js';
+import { createPeerApiHandler, type MorseInbound, type PeerApiOptions } from '../src/cluster/peer-api.js';
+import type { TrustedDevice } from '../src/cluster/trust.js';
 import { createDb } from '../src/mailbox/db.js';
-import { createMailbox, type Mailbox } from '../src/mailbox/mailbox.js';
+import { createMailbox } from '../src/mailbox/mailbox.js';
 
-const CLAUDE_A = { agent: 'claude', sessionId: 'aaaa1111-0000-4000-8000-000000000001' };
-const CODEX_B = { agent: 'codex', sessionId: 'bbbb2222-0000-4000-8000-000000000002' };
-const DIRECTORY: SessionInfo[] = [
-  { agent: 'claude', sessionId: CLAUDE_A.sessionId, title: 'backend', cwd: '/w/a', lastActiveAt: 1 },
-  { agent: 'codex', sessionId: CODEX_B.sessionId, title: 'frontend', cwd: '/w/b', lastActiveAt: 2 },
-];
+const desk: TrustedDevice = { id: 'DESK', name: 'desk', tier: 'owner', addedAt: 0 };
+const ana: TrustedDevice = { id: 'ANA', name: 'ana', tier: 'peer', addedAt: 0 };
+const mine: SessionInfo[] = [{ agent: 'codex', sessionId: 'c-1', title: 'api', cwd: '/w/api', lastActiveAt: 9 }];
 
-const homes: string[] = [];
-const freshHome = () => {
-  const h = mkdtempSync(join(tmpdir(), 'anyd-peerapi-'));
-  homes.push(h);
-  return h;
-};
+/** A handler plus a way to call it with a body (string = raw bytes, else JSON) and read the answer. */
+function harness(extra: Partial<PeerApiOptions> = {}) {
+  const mailbox = createMailbox(createDb(':memory:'));
+  let changed = 0;
+  const handler = createPeerApiHandler({ selfDevice: 'studio', mailbox, localDirectory: async () => mine, onChange: () => void changed++, ...extra });
+  const call = async (caller: TrustedDevice, method: string, url: string, body?: unknown) => {
+    const raw = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))];
+    const req = Object.assign((async function* () { yield* raw; })(), { method, url });
+    const answer = { status: 0, type: '', json: undefined as unknown };
+    const res = {
+      writeHead(status: number, headers: Record<string, string>) {
+        answer.status = status;
+        answer.type = headers['content-type'] ?? '';
+      },
+      end(text: string) {
+        answer.json = JSON.parse(text);
+      },
+    };
+    await handler(req as never, res as never, caller);
+    return answer;
+  };
+  return { mailbox, call, changes: () => changed };
+}
 
-// "mini" serves the peer API; "macbook" is the trusted caller.
-let mini: DeviceIdentity;
-let macbook: DeviceIdentity;
-let mailbox: Mailbox;
-let server: PeerServer;
-let changes = 0;
+const plain = (over: Record<string, unknown> = {}) => ({ from: { agent: 'claude', sessionId: 'far-1' }, to: { agent: 'codex', sessionId: 'c-1' }, text: 'ping', ...over });
 
-beforeAll(async () => {
-  const miniHome = freshHome();
-  mini = loadOrCreateIdentity(miniHome);
-  macbook = loadOrCreateIdentity(freshHome());
-  createTrustStore(miniHome).add({ id: macbook.id, name: 'macbook' });
-  mailbox = createMailbox(createDb(':memory:'));
-  server = await startPeerServer({
-    identity: mini,
-    trust: createTrustStore(miniHome),
-    host: '127.0.0.1',
-    port: 0,
-    handle: createPeerApiHandler({
-      selfDevice: 'mini',
-      selfId: mini.id,
-      mailbox,
-      localDirectory: async () => DIRECTORY,
-      onChange: () => changes++,
-    }),
-  });
-});
-afterAll(() => {
-  server.close();
-  homes.forEach((h) => rmSync(h, { recursive: true, force: true }));
-});
-
-const call = (method: 'GET' | 'POST', path: string, body?: unknown) =>
-  peerRequest({ host: '127.0.0.1', port: server.port, expectedId: mini.id, identity: macbook, selfName: 'macbook', method, path, ...(body ? { body } : {}) });
-
-describe('peer API over mutual TLS (ADR-028)', () => {
-  it('info and sessions', async () => {
-    expect((await call('GET', '/api/peer/info')).body).toMatchObject({ device: 'mini', id: mini.id });
-    const { body } = await call('GET', '/api/peer/sessions');
-    expect((body as { sessions: unknown[] }).sessions).toHaveLength(2);
+describe('peer API: info and sessions', () => {
+  it('GET /api/peer/info names this device (and its ID when known), JSON typed', async () => {
+    expect(await harness().call(desk, 'GET', '/api/peer/info')).toEqual({ status: 200, type: 'application/json; charset=utf-8', json: { device: 'studio' } });
+    expect((await harness({ selfId: 'SELF' }).call(ana, 'GET', '/api/peer/info?v=1')).json).toEqual({ device: 'studio', id: 'SELF' });
   });
 
-  it('relayed message: from.device is the TRUSTED name, never the self-reported one', async () => {
-    const r = await call('POST', '/api/peer/messages', {
-      contextId: 'ctx-remote-1',
-      from: { agent: 'claude', sessionId: CLAUDE_A.sessionId, device: 'some-other-device' },
-      to: { agent: 'codex', sessionId: CODEX_B.sessionId },
-      text: 'relayed hello',
-    });
+  it('own devices may list the local sessions; someone else\'s never can, by any method', async () => {
+    const h = harness();
+    expect(await h.call(desk, 'GET', '/api/peer/sessions')).toMatchObject({ status: 200, json: { sessions: mine } });
+    for (const method of ['GET', 'POST']) expect(await h.call(ana, method, '/api/peer/sessions')).toMatchObject({ status: 403, json: { error: 'peer-tier devices may only send messages' } });
+    expect((await h.call(desk, 'POST', '/api/peer/sessions')).status).toBe(404);
+  });
+
+  it('anything else is 404', async () => {
+    const h = harness();
+    expect(await h.call(desk, 'GET', '/elsewhere')).toMatchObject({ status: 404, json: { error: 'not found' } });
+    expect((await h.call(desk, 'POST', '/api/peer/collab', {})).status).toBe(404);
+  });
+});
+
+describe('peer API: POST /api/peer/messages', () => {
+  it('files the message under the trusted device name, whatever the body claims', async () => {
+    const h = harness();
+    const r = await h.call(desk, 'POST', '/api/peer/messages', plain({ from: { agent: 'claude', sessionId: 'far-1', device: 'forged' }, contextId: 'thread-7' }));
     expect(r.status).toBe(201);
-    const [queued] = mailbox.inbox({ toSession: CODEX_B.sessionId });
-    expect(queued?.contextId).toBe('ctx-remote-1');
-    expect(queued?.from.device).toBe('macbook');
-    expect(queued?.to.device).toBeUndefined();
-    expect(changes).toBeGreaterThan(0);
+    const [m] = h.mailbox.inbox();
+    expect(m).toMatchObject({ from: { agent: 'claude', sessionId: 'far-1', device: 'desk' }, to: { agent: 'codex', sessionId: 'c-1' }, fromTier: 'owner', contextId: 'thread-7' });
+    expect((r.json as { message: { id: string } }).message.id).toBe(m!.id);
+    expect(h.changes()).toBe(1);
   });
 
-  it('rejects malformed relays', async () => {
-    expect((await call('POST', '/api/peer/messages', { text: 'no refs' })).status).toBe(400);
+  it('from someone else\'s device: tier peer, the named session dropped for the inbox, filed under their contact', async () => {
+    const h = harness();
+    expect((await h.call(ana, 'POST', '/api/peer/messages', plain({ contextId: '' }))).status).toBe(201);
+    const [m] = h.mailbox.inbox();
+    expect(m).toMatchObject({ fromTier: 'peer', to: { agent: 'codex', sessionId: 'inbox' }, from: { device: 'ana' }, contactId: 'c:ana' });
   });
 
-  it('unknown route → 404', async () => {
-    expect((await call('GET', '/api/peer/nope')).status).toBe(404);
-    // (ADR-087) the local API is another listener (loopback, token): none of its routes exists on the peer port —
-    // a paired device, mutual TLS and all, cannot reach them
-    const { LOCAL_API_ROUTES } = await import('../src/daemon/server.js');
-    for (const r of LOCAL_API_ROUTES) expect((await call(r.method, r.example, r.method === 'POST' ? {} : undefined)).status, `${r.method} ${r.example}`).toBe(404);
+  it('refuses a body without both session refs (non-empty ids) and a text', async () => {
+    const h = harness();
+    const bad = [{}, plain({ text: 7 }), plain({ from: { agent: 'claude', sessionId: '' } }), plain({ to: { agent: 'codex' } }), plain({ to: 'codex' })];
+    for (const body of bad) expect(await h.call(desk, 'POST', '/api/peer/messages', body)).toMatchObject({ status: 400, json: { error: 'expected {contextId?, from, to, text}' } });
+    expect((await h.call(desk, 'POST', '/api/peer/messages', '')).status).toBe(400); // empty body = {}
+    expect(h.mailbox.inbox()).toEqual([]);
+    expect(h.changes()).toBe(0);
+  });
+
+  it('throws (for the transport to answer) on bad JSON or a body over 5 MiB', async () => {
+    const h = harness();
+    await expect(h.call(desk, 'POST', '/api/peer/messages', '{nope')).rejects.toThrow();
+    await expect(h.call(desk, 'POST', '/api/peer/messages', 'x'.repeat(5 * 1024 * 1024 + 1))).rejects.toThrow('request body too large');
+  });
+});
+
+describe('peer API: Morse hand-over (/api/peer/morse, /api/peer/morse3)', () => {
+  const recorder = () => {
+    const got: Array<[string, unknown]> = [];
+    const inbound: MorseInbound = async (peer, body) => {
+      got.push([peer.name, body]);
+      return { status: 202, body: { request: 'filed' } };
+    };
+    return { got, inbound };
+  };
+
+  it('404 while Morse is not running here', async () => {
+    const h = harness({ morseInbound: () => undefined });
+    expect(await h.call(desk, 'POST', '/api/peer/morse', { kind: 'message' })).toMatchObject({ status: 404, json: { error: 'Morse is not enabled on this device' } });
+    expect((await harness().call(desk, 'POST', '/api/peer/morse3', { sealedV3: {} })).status).toBe(404);
+  });
+
+  it('passes the body and the caller through, and answers with what the Morse layer said', async () => {
+    const { got, inbound } = recorder();
+    const h = harness({ morseInbound: () => inbound });
+    expect(await h.call(ana, 'POST', '/api/peer/morse', { kind: 'message', id: 'm1' })).toMatchObject({ status: 202, json: { request: 'filed' } });
+    expect((await h.call(desk, 'POST', '/api/peer/morse3', { sealedV3: { v: 3 } })).status).toBe(202);
+    expect((await h.call(desk, 'POST', '/api/peer/morse', '')).status).toBe(202); // empty body = {}
+    expect(got).toEqual([['ana', { kind: 'message', id: 'm1' }], ['desk', { sealedV3: { v: 3 } }], ['desk', {}]]);
+  });
+
+  it('keeps sealed and plain apart', async () => {
+    const { got, inbound } = recorder();
+    const h = harness({ morseInbound: () => inbound });
+    expect(await h.call(desk, 'POST', '/api/peer/morse', { sealedV3: {} })).toMatchObject({ status: 400, json: { error: 'a sealed envelope goes to /api/peer/morse3' } });
+    for (const body of [{ kind: 'message' }, 'null', '"text"'])
+      expect(await h.call(desk, 'POST', '/api/peer/morse3', body)).toMatchObject({ status: 400, json: { error: 'expected {sealedV3: <v3 envelope>}' } });
+    expect((await h.call(desk, 'GET', '/api/peer/morse')).status).toBe(404);
+    expect(got).toEqual([]);
   });
 });

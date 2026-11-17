@@ -9,7 +9,7 @@ import { normalizeAddress } from '../identity/address.js';
 export interface SessionRef {
   agent: string;
   sessionId: string;
-  /** Device name for remote refs; unset = this machine. */
+  /** The device the session lives on; absent for a session on this computer. */
   device?: string;
 }
 
@@ -95,7 +95,7 @@ export interface Message {
   lastError?: string;
   /** Morse: 'failed' only because the recipient is not reachable yet; keeps being retried. */
   waiting?: boolean;
-  /** Delivered inside the target's own live session (its own turn), not a separate headless one. */
+  /** True when the message ran as a turn of the target's own open session rather than a separate headless run. */
   deliveredInSession?: boolean;
   /** 'peer' = sent by someone else's agent: pull-only, NOT your operator's instruction. */
   fromTier?: FromTier;
@@ -159,8 +159,8 @@ export interface SendInput {
   text: string;
   contextId?: string;
   via?: string;
-  /** Land in this existing conversation instead of deriving one from the
-   *  (from,to) pair — keeps three-party traffic (user + agent pair) in ONE thread. */
+  /** File into this existing conversation rather than the one of the (from, to) pair, so that a
+   *  third party (e.g. the human joining an agent pair) stays in that single thread. */
   conversationId?: string;
   /** Inbound cross-device mail: the trust tier of the sending device. Unset with a
    *  `from.device` = treated as another person's (ADR-048: unknown is never trusted). */
@@ -208,10 +208,10 @@ export interface InboxQuery {
    *  injected into a session (ADR-048). */
   excludeForeign?: boolean;
   all?: boolean;
-  /** Only strictly-pending messages — excludes 'delivering' (dispatcher-owned) and 'failed'. */
+  /** Just status 'pending' — nothing being delivered right now, nothing awaiting a retry. */
   pendingOnly?: boolean;
-  /** Only messages that dead-lettered (headless delivery gave up). The pull hook's
-   *  fallback: surface a failed push so it's recovered, not lost. `take` marks them delivered. */
+  /** Just the dead messages, whose push delivery was given up. The prompt hook uses it as a
+   *  fallback so such mail still reaches its session; with `take` they become delivered. */
   undeliveredOnly?: boolean;
   /**
    * Only messages a restart found mid-delivery and set aside (`recoverStale`): 'failed', with that note.
@@ -234,9 +234,9 @@ export interface Mailbox {
   getMessage(id: string): Message | null;
   listConversations(): ConversationSummary[];
   listMessages(conversationId: string): Message[];
-  /** Claim the next deliverable message, marking it 'delivering'. `skip` lets the
-   *  dispatcher pass over messages whose local target is being live-monitored
-   *  (they stay pending for `morse message --wait` to pull instead of a headless resume). */
+  /** Take the oldest due message and set it to 'delivering'. With `skip` a caller passes over targets it
+   *  decides on at claim time (e.g. a session following its own mail with `morse message --wait`,
+   *  which must be left pending rather than resumed headlessly). */
   claimNextPending(opts?: ClaimOptions): Message | null;
   /** ADR-052: claim THIS message if it is due (same rules as claimNextPending, scope local:
    *  own-agent mail for a session here, never another person's). null = not due / taken. */
@@ -259,7 +259,7 @@ export interface Mailbox {
   /** ADR-048: a local message whose target session is gone goes to that agent's mailbox
    *  (`<agent>/inbox`, pull-only) instead of dead-lettering. false = not a local message. */
   toMailbox(id: string, note?: string, holder?: string): boolean;
-  /** Requeue messages stranded in 'delivering' by a crashed daemon (at-least-once). */
+  /** After a crash: move rows left in 'delivering' (claimed without a lease) to 'failed' so they are retried. Returns how many. */
   recoverStale(onlyLocal?: boolean): number;
   /** All traffic touching a session (either direction) since a timestamp — for visibility digests.
    *  "Sent by this session" never includes another person's mail: the session id a sender
@@ -407,16 +407,18 @@ export const OWN_THREAD_TO_SESSION_SQL = `(own_thread = 1 AND to_device IS NULL 
 /** SQL: another person's message that is NOT such a reply — ADR-048 still applies in full. */
 const FOREIGN_NOT_OWN_SQL = `(${FOREIGN_SQL} AND NOT ${OWN_THREAD_TO_SESSION_SQL})`;
 
+/** Ordinary reported failures before a message is dead; also the limit on interrupted turns in a row (ADR-089). */
 const MAX_ATTEMPTS = 3;
-/** What `recoverStale` writes on a message it found mid-delivery after a restart. */
 /**
  * (ADR-089) Why a message is dead after its turns were cut off MAX_ATTEMPTS times in a row. The ilink bridge
  * recognises it by its wording ("deliveries in a row were interrupted") to tell the WeChat user what happened.
  */
 export const GAVE_UP_INTERRUPTED = 'gave up: 3 deliveries in a row were interrupted before they were confirmed (the agent may have handled it — check the session)';
+/** What `recoverStale` writes on a message it found mid-delivery after a restart. */
 export const STRANDED_NOTE = 'daemon restarted mid-delivery (message may have been injected)';
 /** Rows read per page while looking for a claimable message. */
 const CLAIM_PAGE = 25;
+/** How long an ordinary failure waits before it is claimable again. */
 const RETRY_BACKOFF_MS = 30_000;
 /** Morse outbox defaults: a message to an unreachable person is retried every 30 s for 30 days. */
 export const DEFAULT_WAIT_RETRY_MS = 30_000;
@@ -452,84 +454,92 @@ export interface HistoryQuery {
   before?: number;
 }
 
-interface MessageRow {
+/** Columns every `messages` row has had since the first schema (`parts` is a JSON array of MessagePart). */
+type BaseTextColumn = 'id' | 'conversation_id' | 'context_id' | 'from_agent' | 'from_session' | 'to_agent' | 'to_session' | 'parts';
+type BaseNullableTextColumn = 'from_device' | 'to_device' | 'last_error';
+type BaseIntColumn = 'attempts' | 'created_at' | 'updated_at';
+type BaseMessageColumns = { [K in BaseTextColumn]: string } & { [K in BaseNullableTextColumn]: string | null } & { [K in BaseIntColumn]: number } & { status: MessageStatus };
+/** Integer columns added by later migrations (absent on a row read before they existed). */
+type AddedIntColumn =
+  | 'delivered_in_session' | 'receipt_at' | 'waiting' | 'request' | 'own_thread' | 'processed_at'
+  | 'lease_pid' | 'lease_at' | 'lease_expires_at' | 'takeovers' | 'lease_started_at' | 'interrupted' | 'lease_hard_until';
+/** Text columns added by later migrations. */
+type AddedTextColumn =
+  | 'from_tier' | 'direction' | 'contact_id' | 'agent' | 'my_address' | 'peer_agent' | 'processed_by'
+  | 'lease_holder' | 'lease_pid_start';
+/** A `messages` row as the driver returns it. */
+type MessageRow = BaseMessageColumns &
+  { [K in AddedIntColumn]?: number | null } &
+  { [K in AddedTextColumn]?: string | null };
+
+/** The columns a new conversation row is written with. */
+const CONVERSATION_COLUMNS = ['id', 'pair_key', 'a_agent', 'a_session', 'a_device', 'b_agent', 'b_session', 'b_device', 'created_at', 'last_message_at'] as const;
+
+/** A `conversations` row with its message count. */
+interface ConversationRow {
   id: string;
-  conversation_id: string;
-  context_id: string;
-  from_agent: string;
-  from_session: string;
-  from_device: string | null;
-  to_agent: string;
-  to_session: string;
-  to_device: string | null;
-  parts: string;
-  status: MessageStatus;
-  attempts: number;
-  last_error: string | null;
-  delivered_in_session?: number | null;
-  direction?: string | null;
-  contact_id?: string | null;
-  agent?: string | null;
-  my_address?: string | null;
-  peer_agent?: string | null;
-  processed_at?: number | null;
-  processed_by?: string | null;
-  from_tier?: string | null;
-  receipt_at?: number | null;
-  waiting?: number | null;
-  request?: number | null;
-  own_thread?: number | null;
-  lease_holder?: string | null;
-  lease_pid?: number | null;
-  lease_at?: number | null;
-  lease_expires_at?: number | null;
-  takeovers?: number | null;
-  lease_pid_start?: string | null;
-  lease_started_at?: number | null;
-  interrupted?: number | null;
-  lease_hard_until?: number | null;
+  a_agent: string;
+  a_session: string;
+  a_device: string | null;
+  b_agent: string;
+  b_session: string;
+  b_device: string | null;
   created_at: number;
-  updated_at: number;
+  last_message_at: number;
+  message_count: number;
 }
 
-function rowToRef(agent: string, session: string, device: string | null): SessionRef {
-  const ref: SessionRef = { agent, sessionId: session };
-  if (device) ref.device = device;
-  return ref;
+/** One end of a message or conversation, as stored in three columns. */
+function endpoint(agent: string, sessionId: string, device: string | null): SessionRef {
+  return device ? { agent, sessionId, device } : { agent, sessionId };
 }
 
-function rowToMessage(row: MessageRow): Message {
-  const msg: Message = {
-    id: row.id,
-    conversationId: row.conversation_id,
-    contextId: row.context_id,
-    from: rowToRef(row.from_agent, row.from_session, row.from_device),
-    to: rowToRef(row.to_agent, row.to_session, row.to_device),
-    parts: JSON.parse(row.parts) as MessagePart[],
-    status: row.status,
-    attempts: row.attempts,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-  if (row.last_error !== null) msg.lastError = row.last_error;
-  if (row.delivered_in_session === 1) msg.deliveredInSession = true;
-  if (row.from_tier === 'peer' || row.from_tier === 'owner') msg.fromTier = row.from_tier;
-  if (typeof row.receipt_at === 'number') msg.receiptAt = row.receipt_at;
-  if (row.waiting === 1) msg.waiting = true;
-  if (row.request === 1) msg.request = true;
-  if (row.own_thread === 1) msg.ownThread = true;
-  if (row.direction === 'in' || row.direction === 'out' || row.direction === 'internal') msg.direction = row.direction;
-  if (row.contact_id) msg.contactId = row.contact_id;
-  if (row.agent) msg.myAgent = row.agent;
-  if (row.my_address) msg.myAddress = row.my_address;
-  else if (row.my_address === '' && row.direction === 'out') msg.fromFirstAddress = true;
-  if (row.peer_agent) msg.peerAgent = row.peer_agent;
-  if (typeof row.processed_at === 'number') msg.processedAt = row.processed_at;
-  if (row.processed_by) msg.processedBy = row.processed_by;
-  if (row.status === 'delivering' && row.lease_holder)
-    msg.lease = { holder: row.lease_holder, pid: row.lease_pid ?? null, since: row.lease_at ?? row.updated_at, expiresAt: row.lease_expires_at ?? 0, ...(row.lease_started_at != null ? { started: true } : {}) };
-  if ((row.takeovers ?? 0) > 0) msg.possibleRepeat = true;
-  return msg;
+/**
+ * Fields of a Message that only appear when the row says so, in the order they are added (the order
+ * shows in JSON output). Each reader returns the fields it contributes, or nothing.
+ */
+const OPTIONAL_FIELDS: ReadonlyArray<(row: MessageRow) => Partial<Message> | undefined> = [
+  (r) => (r.last_error !== null ? { lastError: r.last_error } : undefined),
+  (r) => (r.delivered_in_session === 1 ? { deliveredInSession: true } : undefined),
+  (r) => (r.from_tier === 'peer' || r.from_tier === 'owner' ? { fromTier: r.from_tier } : undefined),
+  (r) => (typeof r.receipt_at === 'number' ? { receiptAt: r.receipt_at } : undefined),
+  (r) => (r.waiting === 1 ? { waiting: true } : undefined),
+  (r) => (r.request === 1 ? { request: true } : undefined),
+  (r) => (r.own_thread === 1 ? { ownThread: true } : undefined),
+  (r) => (r.direction === 'in' || r.direction === 'out' || r.direction === 'internal' ? { direction: r.direction } : undefined),
+  (r) => (r.contact_id ? { contactId: r.contact_id } : undefined),
+  (r) => (r.agent ? { myAgent: r.agent } : undefined),
+  // ADR-081: a recorded address, or — for an outbound row written with '' — "the first address"
+  (r) => (r.my_address ? { myAddress: r.my_address } : r.my_address === '' && r.direction === 'out' ? { fromFirstAddress: true } : undefined),
+  (r) => (r.peer_agent ? { peerAgent: r.peer_agent } : undefined),
+  (r) => (typeof r.processed_at === 'number' ? { processedAt: r.processed_at } : undefined),
+  (r) => (r.processed_by ? { processedBy: r.processed_by } : undefined),
+  // ADR-089: the lease, only while the row is being delivered under one
+  (r) =>
+    r.status === 'delivering' && r.lease_holder
+      ? {
+          lease: {
+            holder: r.lease_holder,
+            pid: r.lease_pid ?? null,
+            since: r.lease_at ?? r.updated_at,
+            expiresAt: r.lease_expires_at ?? 0,
+            ...(r.lease_started_at != null ? { started: true } : {}),
+          },
+        }
+      : undefined,
+  (r) => ((r.takeovers ?? 0) > 0 ? { possibleRepeat: true } : undefined),
+];
+
+/** Turn a stored row into the Message callers see. */
+function toMessage(row: MessageRow): Message {
+  const { id, status, attempts, conversation_id: conversationId, context_id: contextId, created_at: createdAt, updated_at: updatedAt } = row;
+  const from = endpoint(row.from_agent, row.from_session, row.from_device);
+  const to = endpoint(row.to_agent, row.to_session, row.to_device);
+  const parts = JSON.parse(row.parts) as MessagePart[];
+  // key order is visible in JSON output: keep core fields first, in this order
+  const message: Message = { id, conversationId, contextId, from, to, parts, status, attempts, createdAt, updatedAt };
+  for (const read of OPTIONAL_FIELDS) Object.assign(message, read(row));
+  return message;
 }
 
 const defaultPidAlive = (pid: number): boolean => {
@@ -540,11 +550,41 @@ const defaultPidAlive = (pid: number): boolean => {
   }
 };
 
-const pairKey = (a: SessionRef, b: SessionRef): string =>
-  [a, b].map((r) => `${r.device ?? ''}/${r.agent}:${r.sessionId}`).sort().join('|');
+/**
+ * The status part of an inbox query. The narrow selections are exclusive and checked in this order;
+ * without one, every open message (pending, being delivered, or failed and awaiting a retry), or with
+ * `all` no status condition at all (null).
+ */
+function inboxStatusFilter(q: InboxQuery): { sql: string; params: unknown[] } | null {
+  if (q.undeliveredOnly) return { sql: `status = 'dead'`, params: [] };
+  if (q.strandedOnly) return { sql: `status = 'failed' AND last_error = ?`, params: [STRANDED_NOTE] };
+  // (ADR-089) candidates only: whether the lease is really dead (expired, its process gone) is decided per row
+  if (q.deadLeaseOnly) return { sql: `status = 'delivering' AND lease_holder IS NOT NULL`, params: [] };
+  if (q.pendingOnly) return { sql: `status = 'pending'`, params: [] };
+  if (q.all) return null;
+  return { sql: `status IN ('pending', 'delivering', 'failed')`, params: [] };
+}
+
+/**
+ * Where a reported failure leaves a message. A terminal failure (e.g. a timeout whose turn already ran) is
+ * final. A waiting one — nothing wrong with the message, the recipient is just unreachable — is never final on
+ * its count, only on age (see claimNextPending). Any other failure is final on the MAX_ATTEMPTS-th report.
+ */
+function afterFailure(attempts: number, terminal: boolean, waiting: boolean): { status: MessageStatus; waiting: boolean } {
+  if (terminal) return { status: 'dead', waiting: false };
+  if (waiting) return { status: 'failed', waiting: true };
+  return { status: attempts >= MAX_ATTEMPTS ? 'dead' : 'failed', waiting: false };
+}
+
+/** The conversation key of two ends: the same whichever end is the sender. */
+function conversationKey(x: SessionRef, y: SessionRef): string {
+  const label = (r: SessionRef): string => `${r.device ?? ''}/${r.agent}:${r.sessionId}`;
+  const [p, q] = [label(x), label(y)];
+  return p <= q ? `${p}|${q}` : `${q}|${p}`;
+}
 
 export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
-  const now = opts.now ?? Date.now;
+  const { now = Date.now } = opts;
   const pidAlive = opts.pidAlive ?? defaultPidAlive;
   const pidStart = opts.pidStart ?? (opts.pidAlive ? () => null : processStartTime);
   /**
@@ -626,7 +666,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
   const waitRetryMs = opts.waitRetryMs ?? DEFAULT_WAIT_RETRY_MS;
   const waitMaxMs = opts.waitMaxMs ?? DEFAULT_WAIT_MAX_MS;
 
-  const getMessageStmt = db.prepare('SELECT * FROM messages WHERE id = ?');
+  const selectMessage = db.prepare('SELECT * FROM messages WHERE id = ?');
   /** ADR-071: the first message of a thread, when it is ours (sent from here) to this contact. */
   // ADR-077: "this contact" = the same contact or one sharing its old v2 handle (the same person in v2
   // terms — exactly who could answer before contacts were split per address)
@@ -677,35 +717,72 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
 
   /** Set aside by `recoverStale` and not claimed again since: its earlier holder may still report on it. */
   const stranded = (m: Message): boolean => m.status === 'failed' && m.lastError === STRANDED_NOTE;
-  const getMessage = (id: string): Message | null => {
-    const row = getMessageStmt.get(id) as MessageRow | undefined;
-    return row ? rowToMessage(row) : null;
+  function getMessage(id: string): Message | null {
+    const row = selectMessage.get(id) as MessageRow | undefined;
+    return row === undefined ? null : toMessage(row);
+  }
+  /** A message that has to be there; `missing` is the error otherwise. */
+  const mustGet = (id: string, missing = `message not found: ${id}`): Message => {
+    const found = getMessage(id);
+    if (found === null) throw new Error(missing);
+    return found;
   };
 
-  const findConversationId = (from: SessionRef, to: SessionRef): string | undefined => {
-    const row = db
-      .prepare('SELECT id FROM conversations WHERE pair_key = ?')
-      .get(pairKey(from, to)) as { id: string } | undefined;
-    return row?.id;
+  // Conversations: one per unordered pair of ends, keyed by `conversationKey`.
+  const conversationSql = {
+    byKey: db.prepare('SELECT id FROM conversations WHERE pair_key = ?').pluck(),
+    exists: db.prepare('SELECT 1 FROM conversations WHERE id = ?').pluck(),
+    touch: db.prepare('UPDATE conversations SET last_message_at = ? WHERE id = ?'),
+    create: db.prepare(`INSERT INTO conversations (${CONVERSATION_COLUMNS.join(', ')}) VALUES (${CONVERSATION_COLUMNS.map((c) => `@${c}`).join(', ')})`),
   };
-
-  const createConversation = (from: SessionRef, to: SessionRef, ts: number): string => {
-    const id = randomUUID();
-    db.prepare(
-      `INSERT INTO conversations (id, pair_key, a_agent, a_session, a_device, b_agent, b_session, b_device, created_at, last_message_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, pairKey(from, to), from.agent, from.sessionId, from.device ?? null, to.agent, to.sessionId, to.device ?? null, ts, ts);
-    return id;
-  };
-
-  const ensureConversation = (from: SessionRef, to: SessionRef, ts: number): string => {
-    const existing = findConversationId(from, to);
-    if (existing) {
-      db.prepare('UPDATE conversations SET last_message_at = ? WHERE id = ?').run(ts, existing);
-      return existing;
+  /**
+   * The conversation a message between `from` and `to` is filed in, with its activity time moved to `at`.
+   * `chosen` names an existing conversation to use instead (it must exist); otherwise the pair's own one,
+   * created on first use.
+   */
+  const conversationFor = (from: SessionRef, to: SessionRef, at: number, chosen?: string): string => {
+    let id: string | undefined;
+    if (chosen) {
+      if (conversationSql.exists.get(chosen) === undefined) throw new Error(`conversation not found: ${chosen}`);
+      id = chosen;
+    } else {
+      id = conversationSql.byKey.get(conversationKey(from, to)) as string | undefined;
     }
-    return createConversation(from, to, ts);
+    if (id !== undefined) {
+      conversationSql.touch.run(at, id);
+      return id;
+    }
+    const fresh = randomUUID();
+    const row: Record<(typeof CONVERSATION_COLUMNS)[number], string | number | null> = {
+      id: fresh,
+      pair_key: conversationKey(from, to),
+      a_agent: from.agent,
+      a_session: from.sessionId,
+      a_device: from.device ?? null,
+      b_agent: to.agent,
+      b_session: to.sessionId,
+      b_device: to.device ?? null,
+      created_at: at,
+      last_message_at: at,
+    };
+    conversationSql.create.run(row);
+    return fresh;
   };
+
+  const listConversationRows = db.prepare(
+    `SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count
+     FROM conversations c ORDER BY c.last_message_at DESC`,
+  );
+  const newestInConversation = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1');
+  const messagesInConversation = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC');
+
+  /** A new row; status and attempts take the column defaults ('pending', 0). */
+  const insertMessageRow = db.prepare(
+    `INSERT INTO messages (id, conversation_id, context_id, from_agent, from_session, from_device, to_agent, to_session, to_device,
+       parts, from_tier, direction, contact_id, agent, my_address, peer_agent, own_thread, created_at, updated_at)
+     VALUES (@id, @conversation, @context, @fromAgent, @fromSession, @fromDevice, @toAgent, @toSession, @toDevice,
+       @parts, @fromTier, @direction, @contact, @myAgent, @myAddress, @peerAgent, @ownThread, @at, @at)`,
+  );
 
   /** (ADR-083) SQL + parameters: an outbound row sent from this address of mine ('' = the first; `undefined` = any). */
   const sentFrom = (my: string | null | undefined): { sql: string; params: string[] } => {
@@ -737,9 +814,8 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
   };
 
   const insertMessage = (input: SendInput, ts: number): Message => {
+    // ADR-072: threads may run as deep and as fast as the agents like; nothing here limits them
     const id = randomUUID();
-    // ADR-072: no cap on a thread's depth or speed — the tool does not police agent conversations
-    const contextId = input.contextId ?? id;
     const part: MessagePart = input.via ? { type: 'text', text: input.text, via: input.via } : { type: 'text', text: input.text };
     if (input.files?.length) part.files = input.files;
     // ADR-081: what came by address alone is another person's, whatever tier the caller passed
@@ -793,17 +869,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
         }
       }
     }
-    let conversationId: string;
-    if (input.conversationId) {
-      const exists = db
-        .prepare('SELECT id FROM conversations WHERE id = ?')
-        .get(input.conversationId) as { id: string } | undefined;
-      if (!exists) throw new Error(`conversation not found: ${input.conversationId}`);
-      db.prepare('UPDATE conversations SET last_message_at = ? WHERE id = ?').run(ts, input.conversationId);
-      conversationId = input.conversationId;
-    } else {
-      conversationId = ensureConversation(input.from, to, ts);
-    }
+    const conversationId = conversationFor(input.from, to, ts, input.conversationId);
     if (c.peerAgent && c.direction !== 'internal') contacts.seenAgent(c.contactId, c.peerAgent, ts);
     // ADR-081 (ADR-081 review: legacy rows) — every OUTBOUND row records the address of mine it goes out from:
     // the one named; else (review N2) the one this contact knows me by; else '' = "none: this computer's
@@ -813,55 +879,48 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
     if (c.direction === 'out' && input.myAgent && !named) throw new Error(`a sending address was named ("${input.myAgent}") without the address itself — nothing queued`);
     // (ADR-083) with none named: the address of mine the CONTACT belongs to (the row itself — what was `known_as`)
     const myAddress = c.direction === 'out' ? (named ?? (input.firstAddress || c.contactId === SELF_CONTACT ? '' : (c.myAddress ?? ''))) : named;
-    db.prepare(
-      `INSERT INTO messages (id, conversation_id, context_id, from_agent, from_session, from_device, to_agent, to_session, to_device, parts, status, attempts, from_tier, direction, contact_id, agent, my_address, peer_agent, own_thread, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
+    insertMessageRow.run({
       id,
-      conversationId,
-      contextId,
-      input.from.agent,
-      input.from.sessionId,
-      input.from.device ?? null,
-      to.agent,
-      to.sessionId,
-      to.device ?? null,
-      JSON.stringify([part]),
-      fromTier ?? (c.direction === 'in' ? c.fromTier : null),
-      c.direction,
-      c.contactId,
+      conversation: conversationId,
+      context: input.contextId ?? id,
+      fromAgent: input.from.agent,
+      fromSession: input.from.sessionId,
+      fromDevice: input.from.device ?? null,
+      toAgent: to.agent,
+      toSession: to.sessionId,
+      toDevice: to.device ?? null,
+      parts: JSON.stringify([part]),
+      fromTier: fromTier ?? (c.direction === 'in' ? c.fromTier : null),
+      direction: c.direction,
+      contact: c.contactId,
       // ADR-081: outbound — the address of mine it goes out from, when one was named (its local name: display only)
-      c.direction === 'out' && input.myAgent ? input.myAgent : c.agent,
+      myAgent: c.direction === 'out' && input.myAgent ? input.myAgent : c.agent,
       // …and the address itself (out: sent from it · in: written to it) — what every later decision goes by
       myAddress,
-      c.peerAgent,
-      ownThread ? 1 : 0,
-      ts,
-      ts,
-    );
-    const created = getMessage(id);
-    if (!created) throw new Error('insert failed');
-    return created;
+      peerAgent: c.peerAgent,
+      ownThread: ownThread ? 1 : 0,
+      at: ts,
+    });
+    return mustGet(id, 'insert failed');
   };
 
   return {
-    send(input: SendInput): Message {
+    send(input) {
       return insertMessage(input, now());
     },
 
-    reply(messageId: string, text: string, via?: string): Message {
-      const original = getMessage(messageId);
-      if (!original) throw new Error(`message not found: ${messageId}`);
+    reply(messageId, text, via) {
+      const original = mustGet(messageId);
+      // The answer runs back along the same thread: ends swapped, same context, and the same
+      // conversation — even when the original was a third party's aside in an agent pair's thread.
       const input: SendInput = {
         from: original.to,
         to: original.from,
         text,
         contextId: original.contextId,
-        // stay in the original thread — replying to a piggybacked user message
-        // must not fork a user↔agent pair conversation
         conversationId: original.conversationId,
+        ...(via ? { via } : {}),
       };
-      if (via) input.via = via;
       // ADR-081: mail that came by address alone is answered FROM the address it was written to —
       // by that ADDRESS (the name is display only: it may have been changed since; the address has not)
       const native = original.direction === 'in' && Boolean(original.from.device && normalizeAddress(original.from.device));
@@ -878,115 +937,73 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
       return insertMessage(input, now());
     },
 
-    inbox(query: InboxQuery = {}): Message[] {
-      const clauses: string[] = [];
-      const params: unknown[] = [];
-      if (query.undeliveredOnly) clauses.push(`status = 'dead'`);
-      else if (query.strandedOnly) {
-        clauses.push(`status = 'failed' AND last_error = ?`);
-        params.push(STRANDED_NOTE);
-      }
-      else if (query.deadLeaseOnly) {
-        // (ADR-089) candidates only — whether the lease is really dead (expired, its process gone) is decided per row below
-        clauses.push(`status = 'delivering' AND lease_holder IS NOT NULL`);
-      }
-      else if (query.pendingOnly) clauses.push(`status = 'pending'`);
-      else if (!query.all) clauses.push(`status IN ('pending', 'delivering', 'failed')`);
-      if (query.toSession) {
-        clauses.push('to_session = ?');
-        params.push(query.toSession);
-      }
-      if (query.toAgent) {
-        clauses.push('to_agent = ?');
-        params.push(query.toAgent);
-      }
-      if (query.excludeForeign) clauses.push(`NOT ${FOREIGN_NOT_OWN_SQL}`);
+    inbox(query = {}) {
       if (query.take && !query.toSession) throw new Error('inbox take needs a scope (a session) — refusing to mark every message delivered');
-      // take: only what was received here — an outbound message (to_device set) keeps its retries
-      if (query.take) clauses.push('to_device IS NULL');
-      const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const rows = db
-        .prepare(`SELECT * FROM messages ${where} ORDER BY created_at ASC`)
-        .all(...params) as MessageRow[];
-      // the clock is read as often as before ADR-089 for a mailbox that holds no lease (once, when something is
-      // taken): a caller's clock may count its readings
-      let read: number | null = null;
-      const at = (): number => (read ??= now());
-      // (ADR-089) a dead-lease query returns only rows whose lease IS dead; a `take` never returns — never
-      // marks — a row whose lease is live: its holder's turn may still be running
-      const usable = rows.filter((r) => (query.deadLeaseOnly ? leaseDead(r, at()) : !(query.take && r.lease_holder && leaseLive(r, at()))));
-      const messages = usable.map(rowToMessage);
-      // set aside by a restart, or taken over from a holder that is gone AFTER it had started a turn: it may
-      // already have been handled (a claim no turn was started for is not a repeat — review F3)
-      const interrupted = new Set(usable.filter((r) => query.strandedOnly || (query.deadLeaseOnly && r.lease_started_at != null)).map((r) => r.id));
-      for (const m of messages) if (interrupted.has(m.id)) m.possibleRepeat = true;
-      if (query.take && messages.length > 0) {
-        const mark = db.prepare(
-          `UPDATE messages SET status = 'delivered', updated_at = ?, takeovers = takeovers + ?, ${CLEAR_LEASE} WHERE id = ? AND to_device IS NULL AND status IN ('pending', 'delivering', 'failed', 'dead')`,
-        );
-        const ts = at();
-        for (const m of messages) {
-          mark.run(ts, interrupted.has(m.id) ? 1 : 0, m.id);
-          processedMark.run(ts, 'pull', m.id);
-          delete m.lease;
-        }
+      const conditions: string[] = [];
+      const values: unknown[] = [];
+      const where = (sql: string, ...params: unknown[]): void => {
+        conditions.push(sql);
+        values.push(...params);
+      };
+      const status = inboxStatusFilter(query);
+      if (status) where(status.sql, ...status.params);
+      if (query.toSession) where('to_session = ?', query.toSession);
+      if (query.toAgent) where('to_agent = ?', query.toAgent);
+      if (query.excludeForeign) where(`NOT ${FOREIGN_NOT_OWN_SQL}`);
+      // a pull only takes mail received here: an outbound row (to_device set) keeps its retries
+      if (query.take) where('to_device IS NULL');
+      const sql = `SELECT * FROM messages${conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''} ORDER BY created_at ASC`;
+      const rows = db.prepare(sql).all(...values) as MessageRow[];
+
+      // The clock is read lazily, at most once: a mailbox without leases reads it only when it marks
+      // something taken (as before ADR-089), and a caller's clock may count its readings.
+      let clockRead: number | undefined;
+      const at = (): number => (clockRead ??= now());
+      // (ADR-089) a dead-lease query keeps only rows whose lease really is dead; a take never returns —
+      // never marks — a row whose lease is live, since its holder's turn may still be running
+      const kept = rows.filter((r) => (query.deadLeaseOnly ? leaseDead(r, at()) : !(query.take && r.lease_holder && leaseLive(r, at()))));
+      // set aside by a restart, or taken over from a gone holder after it had started a turn: it may already
+      // have been handled (a claim no turn was started for is no repeat — review F3)
+      const maybeHandled = new Set(kept.filter((r) => query.strandedOnly || (query.deadLeaseOnly && r.lease_started_at != null)).map((r) => r.id));
+      const messages = kept.map((r) => (maybeHandled.has(r.id) ? { ...toMessage(r), possibleRepeat: true } : toMessage(r)));
+      if (!query.take || messages.length === 0) return messages;
+
+      const markTaken = db.prepare(
+        `UPDATE messages SET status = 'delivered', updated_at = ?, takeovers = takeovers + ?, ${CLEAR_LEASE} WHERE id = ? AND to_device IS NULL AND status IN ('pending', 'delivering', 'failed', 'dead')`,
+      );
+      const takenAt = at();
+      for (const m of messages) {
+        markTaken.run(takenAt, maybeHandled.has(m.id) ? 1 : 0, m.id);
+        processedMark.run(takenAt, 'pull', m.id);
+        delete m.lease;
       }
       return messages;
     },
 
     getMessage,
 
-    listConversations(): ConversationSummary[] {
-      const rows = db
-        .prepare('SELECT * FROM conversations ORDER BY last_message_at DESC')
-        .all() as Array<{
-        id: string;
-        a_agent: string;
-        a_session: string;
-        a_device: string | null;
-        b_agent: string;
-        b_session: string;
-        b_device: string | null;
-        created_at: number;
-        last_message_at: number;
-      }>;
-      return rows.map((row) => {
-        const count = (
-          db.prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?').get(row.id) as { n: number }
-        ).n;
-        const last = db
-          .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1')
-          .get(row.id) as MessageRow | undefined;
-        const summary: ConversationSummary = {
-          id: row.id,
-          a: rowToRef(row.a_agent, row.a_session, row.a_device),
-          b: rowToRef(row.b_agent, row.b_session, row.b_device),
-          createdAt: row.created_at,
-          lastMessageAt: row.last_message_at,
-          messageCount: count,
-        };
-        if (last) summary.lastMessage = rowToMessage(last);
-        return summary;
+    listConversations() {
+      return (listConversationRows.all() as ConversationRow[]).map((row) => {
+        const { id, created_at: createdAt, last_message_at: lastMessageAt, message_count: messageCount } = row;
+        const a = endpoint(row.a_agent, row.a_session, row.a_device);
+        const b = endpoint(row.b_agent, row.b_session, row.b_device);
+        const newest = newestInConversation.get(id) as MessageRow | undefined;
+        const summary: ConversationSummary = { id, a, b, createdAt, lastMessageAt, messageCount };
+        return newest === undefined ? summary : { ...summary, lastMessage: toMessage(newest) };
       });
     },
 
-    listMessages(conversationId: string): Message[] {
-      const rows = db
-        .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC')
-        .all(conversationId) as MessageRow[];
-      return rows.map(rowToMessage);
+    listMessages(conversationId) {
+      return (messagesInConversation.all(conversationId) as MessageRow[]).map(toMessage);
     },
 
-    retry(id: string): Message {
-      const current = getMessage(id);
-      if (!current) throw new Error(`message not found: ${id}`);
-      if (current.status !== 'failed' && current.status !== 'dead') {
-        throw new Error(`only failed/dead messages can be retried (status: ${current.status})`);
-      }
+    retry(id) {
+      const { status } = mustGet(id);
+      const retryable: MessageStatus[] = ['failed', 'dead'];
+      if (!retryable.includes(status)) throw new Error(`only failed/dead messages can be retried (status: ${status})`);
+      // a fresh start: no attempts counted, no longer waiting for an unreachable recipient
       db.prepare(`UPDATE messages SET status = 'pending', attempts = 0, waiting = 0, updated_at = ? WHERE id = ?`).run(now(), id);
-      const updated = getMessage(id);
-      if (!updated) throw new Error('update failed');
-      return updated;
+      return mustGet(id, 'update failed');
     },
 
     toMailbox(id: string, note?: string, holder?: string): boolean {
@@ -1014,24 +1031,18 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
       // here is what was claimed without one — the daemon's own outbound deliveries, a plugin that asks for none.
       // (the holder may still be running — a plugin of the run before finishing its turn: its ack / nack is still
       // taken afterwards, see `stranded`; a pull for the session takes the message too, see `strandedOnly`)
-      const result = db
-        .prepare(
-          `UPDATE messages SET status = 'failed', last_error = ?, updated_at = ?
-           WHERE status = 'delivering' AND lease_holder IS NULL ${onlyLocal ? `AND to_device IS NULL AND to_agent != 'user'` : ''}`,
-        )
-        .run(STRANDED_NOTE, now());
-      return result.changes;
+      const localOnly = onlyLocal ? ` AND to_device IS NULL AND to_agent != 'user'` : '';
+      const setAside = db.prepare(`UPDATE messages SET status = 'failed', last_error = ?, updated_at = ? WHERE status = 'delivering' AND lease_holder IS NULL${localOnly}`);
+      return setAside.run(STRANDED_NOTE, now()).changes;
     },
 
-    recentActivity(sessionId: string, sinceMs: number, limit = 10): Message[] {
-      const rows = db
-        .prepare(
-          `SELECT * FROM messages
-           WHERE (to_session = ? OR (from_session = ? AND NOT ${FOREIGN_SQL})) AND updated_at > ?
-           ORDER BY created_at ASC LIMIT ?`,
-        )
-        .all(sessionId, sessionId, sinceMs, limit) as MessageRow[];
-      return rows.map(rowToMessage);
+    recentActivity(sessionId, sinceMs, limit = 10) {
+      // to the session, or sent by it — where "by it" can only be our own mail, never another person's claim
+      const touching = db.prepare(
+        `SELECT * FROM messages WHERE updated_at > @since AND (to_session = @session OR (from_session = @session AND NOT ${FOREIGN_SQL}))
+         ORDER BY created_at ASC LIMIT @limit`,
+      );
+      return (touching.all({ session: sessionId, since: sinceMs, limit }) as MessageRow[]).map(toMessage);
     },
 
     foreignWaiting(sinceMs: number): Message[] {
@@ -1041,7 +1052,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
            ORDER BY created_at ASC`,
         )
         .all(sinceMs) as MessageRow[];
-      return rows.map(rowToMessage);
+      return rows.map(toMessage);
     },
 
     markReceipt(id: string, at?: number): boolean {
@@ -1083,7 +1094,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
     requestMessages(handle: string, my?: string | null): Message[] {
       const h = handle.trim().toLowerCase();
       const from = sentFrom(my);
-      return (db.prepare(`SELECT * FROM messages WHERE request = 1 AND ${toHandle}${from.sql} ORDER BY created_at ASC`).all(h, h, h, ...from.params) as MessageRow[]).map(rowToMessage);
+      return (db.prepare(`SELECT * FROM messages WHERE request = 1 AND ${toHandle}${from.sql} ORDER BY created_at ASC`).all(h, h, h, ...from.params) as MessageRow[]).map(toMessage);
     },
 
     requests,
@@ -1167,7 +1178,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
         params.push(q.agent);
       }
       const rows = db.prepare(`SELECT * FROM messages WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC, rowid ASC${q.limit ? ` LIMIT ${Math.max(1, Math.floor(q.limit))}` : ''}`).all(...params) as MessageRow[];
-      return rows.map(rowToMessage);
+      return rows.map(toMessage);
     },
 
     unread(my?: string | null): Record<string, number> {
@@ -1200,7 +1211,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
       const rows = db
         .prepare(`SELECT * FROM messages WHERE contact_id = ?${pair.sql} ${q.before ? 'AND created_at < ?' : ''} ORDER BY created_at DESC, rowid DESC LIMIT ${limit}`)
         .all(contactId, ...pair.params, ...(q.before ? [q.before] : [])) as MessageRow[];
-      return rows.reverse().map(rowToMessage);
+      return rows.reverse().map(toMessage);
     },
 
     contactOf,
@@ -1233,7 +1244,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
       const rows = db
         .prepare(`SELECT rowid AS seq, * FROM messages WHERE rowid > ? AND direction IN ('in', 'internal') AND to_device IS NULL ORDER BY rowid ASC LIMIT ?`)
         .all(seq, limit) as Array<MessageRow & { seq: number }>;
-      return rows.map((r) => ({ ...rowToMessage(r), seq: r.seq }));
+      return rows.map((r) => ({ ...toMessage(r), seq: r.seq }));
     },
 
     seqOf(id: string): number {
@@ -1291,7 +1302,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
       const lease = withStart(opts.lease);
       const opts2: ClaimOptions = lease ? { ...opts, lease } : opts;
       const look = lookUp();
-      const claim = db.transaction((): Message | null => {
+      const claimOldestDue = (): Message | null => {
         const t = now();
         // Morse: a message that waited the whole window for an unreachable person gives up
         db.prepare(
@@ -1346,8 +1357,8 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
           const last = rows[rows.length - 1]!;
           after = { created: last.created_at, seq: last.seq };
         }
-      });
-      return claim.immediate();
+      };
+      return db.transaction(claimOldestDue).immediate();
     },
 
     extendLease(id: string, holder: string, opts3: { ttlMs?: number; pid?: number; started?: boolean; maxMs?: number } = {}): boolean {
@@ -1369,7 +1380,7 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
     liveLeases(): Message[] {
       const t = now();
       const rows = db.prepare(`SELECT * FROM messages WHERE status = 'delivering' AND lease_holder IS NOT NULL ORDER BY created_at ASC`).all() as MessageRow[];
-      return rows.filter((r) => leaseLive(r, t)).map(rowToMessage);
+      return rows.filter((r) => leaseLive(r, t)).map(toMessage);
     },
 
     markDelivered(id: string, opts?: { inSession?: boolean; holder?: string; by?: string }): Message {
@@ -1382,52 +1393,44 @@ export function createMailbox(db: Db, opts: MailboxOptions = {}): Mailbox {
     },
   };
 
+  /**
+   * The row `id`, provided `holder` may report its outcome now (otherwise throws, nothing changed).
+   * (ADR-089) A row held under a lease takes reports from its current holder only, and a caller that names a
+   * holder must be holding the row right now — so a holder that was taken over, or reports twice, is refused.
+   * A row without a lease must be mid-delivery — or (ADR-087 follow-up 5) set aside by a restart while its
+   * holder, a plugin of the previous run still finishing, kept going and nobody has claimed it since.
+   */
+  function reportable(id: string, holder: string | undefined, outcome: 'delivered' | 'failed'): Message {
+    const current = mustGet(id);
+    const underLease = current.lease !== undefined || holder !== undefined;
+    if (underLease && (current.status !== 'delivering' || !holderOk(current, holder))) {
+      throw lost(id, outcome === 'delivered' ? 'the ack' : 'the nack');
+    }
+    if (!underLease && current.status !== 'delivering' && !stranded(current)) {
+      throw new Error(`illegal transition: ${current.status} -> ${outcome} (must claim first)`);
+    }
+    return current;
+  }
+
   function markDeliveredNow(id: string, opts?: { inSession?: boolean; holder?: string; by?: string }): Message {
-      const current = getMessage(id);
-      if (!current) throw new Error(`message not found: ${id}`);
-      // (ADR-089) under a lease only the current holder's report counts — and a caller that names a holder must
-      // be holding the row now: a holder that was taken over, or reports twice, changes nothing
-      if (current.lease || opts?.holder !== undefined) {
-        if (current.status !== 'delivering' || !holderOk(current, opts?.holder)) throw lost(id, 'the ack');
-      } else
-      // (ADR-087 follow-up 5) a restart set this message aside as "mid-delivery" while its holder — a plugin of the
-      // run before that was still finishing, or one that started a moment earlier — went on delivering it: the
-      // holder's report still counts, as long as nobody claimed the message again since
-      if (current.status !== 'delivering' && !stranded(current)) {
-        throw new Error(`illegal transition: ${current.status} -> delivered (must claim first)`);
-      }
-      const done = db
-        .prepare(`UPDATE messages SET status = 'delivered', delivered_in_session = ?, waiting = 0, interrupted = 0, updated_at = ?, ${CLEAR_LEASE} WHERE id = ? AND lease_holder IS ?`)
-        .run(opts?.inSession ? 1 : null, now(), id, opts?.holder ?? null);
-      if (done.changes === 0) throw lost(id, 'the ack');
-      // a received message the dispatcher delivered into a session is processed (ADR-049)
-      processedMark.run(now(), opts?.by ?? 'dispatcher', id);
-      const updated = getMessage(id);
-      if (!updated) throw new Error('update failed');
-      return updated;
+    reportable(id, opts?.holder, 'delivered');
+    const done = db
+      .prepare(`UPDATE messages SET status = 'delivered', delivered_in_session = ?, waiting = 0, interrupted = 0, updated_at = ?, ${CLEAR_LEASE} WHERE id = ? AND lease_holder IS ?`)
+      .run(opts?.inSession ? 1 : null, now(), id, opts?.holder ?? null);
+    if (done.changes === 0) throw lost(id, 'the ack');
+    // a received message the dispatcher delivered into a session is processed (ADR-049)
+    processedMark.run(now(), opts?.by ?? 'dispatcher', id);
+    return mustGet(id, 'update failed');
   }
 
   function markFailedNow(id: string, error: string, opts?: { terminal?: boolean; waiting?: boolean; holder?: string }): Message {
-      const current = getMessage(id);
-      if (!current) throw new Error(`message not found: ${id}`);
-      if (current.lease || opts?.holder !== undefined) {
-        if (current.status !== 'delivering' || !holderOk(current, opts?.holder)) throw lost(id, 'the nack');
-      } else if (current.status !== 'delivering' && !stranded(current)) {
-        throw new Error(`illegal transition: ${current.status} -> failed (must claim first)`);
-      }
-      const attempts = current.attempts + 1;
-      // waiting = nothing wrong with the message, the recipient is just unreachable:
-      // never dead-letter it on attempt count (only on age, see claimNextPending)
-      const waiting = Boolean(opts?.waiting) && !opts?.terminal;
-      // terminal = don't auto-retry (e.g. a timeout whose turn already ran)
-      const status: MessageStatus = opts?.terminal || (!waiting && attempts >= MAX_ATTEMPTS) ? 'dead' : 'failed';
-      // (review F4) a holder that REPORTS ends the run of interrupted turns: `interrupted` starts again at 0
-      const done = db
-        .prepare(`UPDATE messages SET status = ?, attempts = ?, last_error = ?, waiting = ?, interrupted = 0, updated_at = ?, ${CLEAR_LEASE} WHERE id = ? AND lease_holder IS ?`)
-        .run(status, attempts, error, waiting ? 1 : 0, now(), id, opts?.holder ?? null);
-      if (done.changes === 0) throw lost(id, 'the nack');
-      const updated = getMessage(id);
-      if (!updated) throw new Error('update failed');
-      return updated;
+    const { attempts } = reportable(id, opts?.holder, 'failed');
+    const outcome = afterFailure(attempts + 1, Boolean(opts?.terminal), Boolean(opts?.waiting));
+    // (review F4) a holder that REPORTS ends the run of interrupted turns: `interrupted` starts again at 0
+    const done = db
+      .prepare(`UPDATE messages SET status = ?, attempts = ?, last_error = ?, waiting = ?, interrupted = 0, updated_at = ?, ${CLEAR_LEASE} WHERE id = ? AND lease_holder IS ?`)
+      .run(outcome.status, attempts + 1, error, outcome.waiting ? 1 : 0, now(), id, opts?.holder ?? null);
+    if (done.changes === 0) throw lost(id, 'the nack');
+    return mustGet(id, 'update failed');
   }
 }

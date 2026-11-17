@@ -1,8 +1,7 @@
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SessionInfo } from '../adapters/types.js';
 import type { Peer } from '../cluster/peers.js';
 import type { RelayState } from '../cluster/relay-client.js';
@@ -10,10 +9,14 @@ import type { UntrustedContact } from '../cluster/secure-transport.js';
 import type { TrustStore } from '../cluster/trust.js';
 import type { Mailbox, MessageFile, SessionRef } from '../mailbox/mailbox.js';
 import { DAEMON_CAPABILITIES } from './capabilities.js';
-import { createHmac } from 'node:crypto';
 import { bindExternalSession, externalAgentOfToken, externalBinding, LOCAL_TOKEN_HEADER, MAX_EXTERNAL_SESSION_ID, PING_CHALLENGE_HEADER, sameToken } from './local-api.js';
 
-const require = createRequire(import.meta.url);
+// The daemon's local HTTP API: what the `morse` command, hooks, plugins, external apps and the web console
+// talk to. It listens on 127.0.0.1 only; other computers reach the daemon through the mutual-TLS peer
+// server (ADR-028). Every route, and who may call it, is listed in LOCAL_API_ROUTES (ADR-087).
+
+/** The web console page shipped with the package (webui/index.html). */
+const CONSOLE_PAGE = fileURLToPath(new URL('../../webui/index.html', import.meta.url));
 
 export interface ConsoleServerOptions {
   mailbox: Mailbox;
@@ -23,19 +26,19 @@ export interface ConsoleServerOptions {
    * Required: there is no way to start this server without it.
    */
   token: string;
+  /** The session directory (local sessions plus registered external ones). */
   directory: () => Promise<SessionInfo[]>;
+  /** Listening port on 127.0.0.1 (default 7433). */
   port?: number;
-  /** Poll interval for external mailbox writers (CLI in another process). */
+  /** How often to look for mailbox writes made by other processes (a `morse send` in a shell, hooks). */
   changePollMs?: number;
-  /** Root for the external-agent registry (ADR-024); defaults to ~. Injectable for tests. */
+  /** Home folder of the external-agent registry (ADR-024); default the user's home. Tests point it elsewhere. */
   registryHome?: string;
-  /** Drop the caller's directory cache. Called when an external agent registers,
-   *  so it is addressable immediately instead of after the cache TTL — otherwise
-   *  the first reply to a just-registered agent fails with a confusing not_found. */
+  /** Forget the caller's cached directory. Called after an external agent registers, so it can be addressed
+   *  right away instead of answering "not found" until the cache runs out. */
   invalidateDirectory?: () => void;
-  /** Pre-send check for a LOCAL target (ADR-025): non-null = refuse the send with
-   *  409 and queue nothing, so the sender sees e.g. a CLI version mismatch now —
-   *  instead of a silent dead letter whose cause the pull-hook recovery hides. */
+  /** Check a LOCAL target before anything is queued (ADR-025). A string refuses the send with 409 and that
+   *  text, so the sender learns about e.g. a CLI version mismatch now rather than through a dead letter. */
   preflight?: (session: SessionInfo) => Promise<string | null>;
   /** Morse: a paired device reachable through the relay. Lets /api/send address
    *  `@device/agent:session` directly — the relay carries no session directory. */
@@ -74,15 +77,16 @@ export interface ConsoleServerOptions {
   shutdown?: { run: () => void };
   /** ADR-039: auto-update view for `morse update` — is a file transfer in progress (defer)? */
   updateStatus?: () => { busy: string | null; release: number; version: string };
-  /** LAN peering status for /api/peers. The peer API itself is served by the
-   *  separate mutual-TLS peer server (ADR-028); this console stays loopback-only. */
+  /** What GET /api/peers reports. The peer API itself runs on its own mutual-TLS server (ADR-028). */
   peering?: {
+    /** This computer's device name and id. */
     selfDevice: string;
     selfId: string;
-    /** Live LAN peer list (mDNS + static). */
+    /** Peers seen on the LAN right now (mDNS and static entries); absent = relay only, no LAN discovery. */
     peers?: () => Peer[];
+    /** Paired devices. */
     trust?: TrustStore;
-    /** Devices with a valid certificate that tried to talk to us but aren't paired. */
+    /** Devices with a valid certificate that tried to reach us without being paired. */
     pending?: () => UntrustedContact[];
     /** Morse relay status (when configured). */
     relay?: () => { url: string; connected: boolean; state?: RelayState } | null;
@@ -91,19 +95,10 @@ export interface ConsoleServerOptions {
 
 export interface RunningServer {
   port: number;
+  /** Tell every open event stream that something changed. */
   notifyChange(): void;
+  /** Stop polling, end the event streams and stop listening. */
   close(): void;
-}
-
-interface SendBody {
-  from: SessionRef;
-  to: SessionRef;
-  text: string;
-}
-
-/** Machine-readable code from a preflight error's `<code>: …` prefix. */
-function preflightCode(error: string): string {
-  return /^([a-z_]+):/.exec(error)?.[1] ?? 'preflight_failed';
 }
 
 /**
@@ -171,121 +166,206 @@ class HttpError extends Error {
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const CONSOLE_CODE_TTL_MS = 60_000;
 const CONSOLE_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_PORT = 7433;
+const DEFAULT_CHANGE_POLL_MS = 1500;
+/** The most sessions one /api/sessions answer lists when a limit is asked for. */
+const MAX_SESSION_LIMIT = 200;
 
-function json(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-  res.end(payload);
+const REGISTER_USAGE = 'expected {agent, sessionId, title?, cwd?}';
+const MESSAGES_USAGE = 'expected {from:{agent,sessionId}, to:{agent,sessionId}, text, conversationId?}';
+const NO_RELAY = 'Morse relay is not enabled on this daemon';
+
+// ---------------------------------------------------------------------------------------------
+// Small HTTP helpers
+// ---------------------------------------------------------------------------------------------
+
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } as const;
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, JSON_HEADERS);
+  res.end(text);
 }
 
 /**
  * The JSON body of a request. ADR-087: only `Content-Type: application/json` is read — a web page can post
  * `text/plain` to a loopback port without the browser asking first (a "simple" cross-origin request), and
- * what it posted used to be parsed as JSON all the same.
+ * what it posted used to be parsed as JSON all the same. An empty body reads as `{}`.
  */
-async function readBody(req: IncomingMessage): Promise<unknown> {
-  const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
-  if (type !== 'application/json') {
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const mediaType = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+  if (mediaType !== 'application/json') {
     req.resume();
     throw new HttpError(415, 'the body must be sent as Content-Type: application/json');
   }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const c of req) {
-    size += (c as Buffer).length;
-    // (too large: the rest is read and dropped, so that the sender gets its answer instead of a broken connection)
-    if (size <= MAX_BODY_BYTES) chunks.push(c as Buffer);
-    else chunks.length = 0;
+  // An oversized body is still read to the end (and dropped) so the sender gets an answer rather than a reset.
+  let total = 0;
+  const kept: Buffer[] = [];
+  for await (const piece of req as AsyncIterable<Buffer>) {
+    total += piece.length;
+    if (total > MAX_BODY_BYTES) kept.length = 0;
+    else kept.push(piece);
   }
-  if (size > MAX_BODY_BYTES) throw new HttpError(413, 'the request body is too large');
-  const raw = Buffer.concat(chunks).toString('utf8');
+  if (total > MAX_BODY_BYTES) throw new HttpError(413, 'the request body is too large');
+  const text = Buffer.concat(kept).toString('utf8');
+  if (text === '') return {};
   try {
-    return raw ? JSON.parse(raw) : {};
+    return JSON.parse(text) as unknown;
   } catch {
     throw new HttpError(400, 'the body is not valid JSON');
   }
 }
 
-function isSessionRef(v: unknown): v is SessionRef {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    typeof (v as SessionRef).agent === 'string' &&
-    typeof (v as SessionRef).sessionId === 'string'
-  );
+/** Has the shape of a SessionRef: an object with string `agent` and `sessionId`. */
+function looksLikeSessionRef(value: unknown): value is SessionRef {
+  if (typeof value !== 'object' || value === null) return false;
+  const { agent, sessionId } = value as Record<string, unknown>;
+  return typeof agent === 'string' && typeof sessionId === 'string';
+}
+
+/** The machine-readable code of a preflight refusal: its leading `<code>:`, else 'preflight_failed'. */
+function refusalCode(refusal: string): string {
+  const match = refusal.match(/^([a-z_]+):/);
+  return match ? match[1]! : 'preflight_failed';
+}
+
+/** A positive `limit` query parameter, capped at MAX_SESSION_LIMIT; `fallback` when absent or nonsense. */
+function limitParam(params: URLSearchParams, fallback: number | null): number | null {
+  const asked = Number.parseInt(params.get('limit') ?? '', 10);
+  return Number.isFinite(asked) && asked > 0 ? Math.min(asked, MAX_SESSION_LIMIT) : fallback;
 }
 
 /**
- * Optional narrowing for GET /api/sessions. The unfiltered directory is 4000+
- * sessions (~850KB) on a real machine — fine for the console, unusable inside an
- * agent's turn. With no query params the response is unchanged.
+ * GET /api/sessions for the daemon token and the console. A real directory can hold thousands of
+ * sessions — fine for the console page, far too much inside an agent's turn — so `agent`, `q` (text in the
+ * title or folder, any case) and `limit` narrow it. Without them the answer is the whole directory.
  */
-function filterSessions(sessions: SessionInfo[], params: URLSearchParams): SessionInfo[] {
-  const agent = params.get('agent');
-  const q = params.get('q');
-  const rawLimit = Number.parseInt(params.get('limit') ?? '', 10);
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : null;
+function narrowSessions(all: SessionInfo[], params: URLSearchParams): SessionInfo[] {
+  const agent = params.get('agent')?.toLowerCase();
+  const text = params.get('q')?.toLowerCase();
+  const limit = limitParam(params, null);
+  const hits = all.filter(
+    (s) =>
+      (!agent || s.agent === agent) &&
+      (!text || s.title.toLowerCase().includes(text) || s.cwd.toLowerCase().includes(text)),
+  );
+  return limit === null ? hits : hits.slice(0, limit);
+}
 
-  let out = sessions;
-  if (agent) out = out.filter((s) => s.agent === agent.toLowerCase());
-  if (q) {
-    const needle = q.toLowerCase();
-    out = out.filter(
-      (s) => s.title.toLowerCase().includes(needle) || s.cwd.toLowerCase().includes(needle),
-    );
-  }
-  return limit === null ? out : out.slice(0, limit);
+// ---------------------------------------------------------------------------------------------
+// Change notification: the event stream and the mailbox poll
+// ---------------------------------------------------------------------------------------------
+
+const eventLine = (kind: 'hello' | 'changed'): string => `data: {"kind":"${kind}"}\n\n`;
+
+/** Open server-sent-event streams (`/api/events`); each gets `{"kind":"changed"}` when something moved. */
+function createEventStreams() {
+  const open = new Set<ServerResponse>();
+  return {
+    attach(req: IncomingMessage, res: ServerResponse): void {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+      res.write(eventLine('hello'));
+      open.add(res);
+      req.on('close', () => open.delete(res));
+    },
+    changed(): void {
+      const line = eventLine('changed');
+      for (const res of open) res.write(line);
+    },
+    endAll(): void {
+      for (const res of open) res.end();
+    },
+  };
+}
+
+/**
+ * Watch the mailbox for writes this process did not announce (other processes share the database).
+ * A fingerprint of the message table — count, newest update, and the last row's id, update time and
+ * status — is compared on every tick; `onChange` fires when it differs from the previous one.
+ */
+function watchMailbox(mailbox: Mailbox, everyMs: number, onChange: () => void): NodeJS.Timeout {
+  let previous: string | undefined;
+  return setInterval(() => {
+    try {
+      const all = mailbox.inbox({ all: true });
+      const last = all.at(-1);
+      let newest = 0;
+      for (const m of all) if (m.updatedAt > newest) newest = m.updatedAt;
+      const fingerprint = JSON.stringify([all.length, newest, last?.id, last?.updatedAt, last?.status]);
+      if (previous !== undefined && fingerprint !== previous) onChange();
+      previous = fingerprint;
+    } catch {
+      // a busy or locked database now and then is no reason to stop watching
+    }
+  }, everyMs);
+}
+
+/** Short-lived random tokens with an expiry (console codes and console sessions, ADR-087). */
+function createTokenJar(ttlMs: number) {
+  const expiry = new Map<string, number>();
+  const prune = (): void => {
+    const t = Date.now();
+    for (const [token, until] of expiry) if (until <= t) expiry.delete(token);
+  };
+  /** The stored token equal to `given` (compared in constant time, every one of them), or null. */
+  const find = (given: string): string | null => {
+    prune();
+    let hit: string | null = null;
+    for (const token of expiry.keys()) if (sameToken(given, token)) hit = token;
+    return hit;
+  };
+  return {
+    ttlMs,
+    issue(): string {
+      prune();
+      const token = randomBytes(24).toString('hex');
+      expiry.set(token, Date.now() + ttlMs);
+      return token;
+    },
+    holds: (given: string): boolean => find(given) !== null,
+    /** Use up a token once: true when it was valid. */
+    redeem(given: string): boolean {
+      const hit = find(given);
+      if (hit !== null) expiry.delete(hit);
+      return hit !== null;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server
+// ---------------------------------------------------------------------------------------------
+
+/** What a handler answers: a JSON reply, or nothing when it wrote the response itself. */
+type Reply = { status: number; body: unknown } | void;
+const reply = (status: number, body: unknown): Reply => ({ status, body });
+
+interface RequestContext {
+  req: IncomingMessage;
+  res: ServerResponse;
+  url: URL;
+  caller: Caller | null;
+  /** The agent name of an external caller (ADR-087: it acts as itself only), else null. */
+  external: string | null;
+  /** The id a route with a pattern captures from the path (a message or conversation id). */
+  param(): string;
+  /** The request's JSON body. */
+  body<T>(): Promise<T>;
+  /** Run `fn` once the reply has been written. */
+  afterReply(fn: () => void): void;
 }
 
 /** Local-only web console: REST + SSE + static UI, bound to 127.0.0.1. */
 export function startConsoleServer(opts: ConsoleServerOptions): RunningServer {
-  const port = opts.port ?? 7433;
-  const sseClients = new Set<ServerResponse>();
-  const webuiFile = join(dirname(require.resolve('../../package.json')), 'webui', 'index.html');
-
-  const broadcast = (): void => {
-    for (const res of sseClients) res.write(`data: {"kind":"changed"}\n\n`);
-  };
-
-  // catch writes from other processes (morse send in a shell, hooks, agents)
-  let lastStamp = '';
-  const pollTimer = setInterval(() => {
-    try {
-      const msgs = opts.mailbox.inbox({ all: true });
-      const last = msgs[msgs.length - 1];
-      const stamp = `${msgs.length}:${last ? `${last.id}:${last.updatedAt}:${last.status}` : ''}`;
-      const changedSince = msgs.reduce((acc, m) => Math.max(acc, m.updatedAt), 0);
-      const full = `${stamp}:${changedSince}`;
-      if (lastStamp && full !== lastStamp) broadcast();
-      lastStamp = full;
-    } catch {
-      /* transient read errors must not kill the poller */
-    }
-  }, opts.changePollMs ?? 1500);
-
-  const server = createServer((req, res) => {
-    void handle(req, res).catch((e) => {
-      if (res.headersSent) return void res.end();
-      if (e instanceof HttpError) return json(res, e.status, { error: e.message });
-      json(res, 500, { error: e instanceof Error ? e.message : String(e) });
-    });
-  });
-
-  // ---- ADR-087: console sessions (the web console page) -------------------------------------
-  /** one-time code → when it expires (handed out to `morse console`, exchanged once by the page) */
-  const consoleCodes = new Map<string, number>();
-  /** session token → when it expires (kept by the page in sessionStorage, sent in the token header) */
-  const consoleSessions = new Map<string, number>();
-  const sweep = (m: Map<string, number>): void => {
-    const now = Date.now();
-    for (const [k, until] of m) if (until <= now) m.delete(k);
-  };
-  const consoleSessionOf = (given: string): boolean => {
-    sweep(consoleSessions);
-    let hit = false;
-    for (const t of consoleSessions.keys()) if (sameToken(given, t)) hit = true;
-    return hit;
-  };
+  const port = opts.port ?? DEFAULT_PORT;
+  const streams = createEventStreams();
+  const poll = watchMailbox(opts.mailbox, opts.changePollMs ?? DEFAULT_CHANGE_POLL_MS, streams.changed);
+  const changed = streams.changed;
+  /** one-time codes handed to `morse console`, traded once by the page it opens for a session */
+  const consoleCodes = createTokenJar(CONSOLE_CODE_TTL_MS);
+  /** console sessions, kept by the page in sessionStorage and sent in the token header */
+  const consoleSessions = createTokenJar(CONSOLE_SESSION_TTL_MS);
+  const homeOpt = opts.registryHome ? { home: opts.registryHome } : {};
 
   /** The names this server answers to: its loopback addresses with ITS port (a name that merely resolves here is not one — DNS rebinding). */
   const ownHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
@@ -295,588 +375,501 @@ export function startConsoleServer(opts: ConsoleServerOptions): RunningServer {
     const given = req.headers[LOCAL_TOKEN_HEADER];
     if (typeof given !== 'string' || !given) return null;
     if (sameToken(given, opts.token)) return { kind: 'daemon' };
-    if (consoleSessionOf(given)) return { kind: 'console' };
+    if (consoleSessions.holds(given)) return { kind: 'console' };
     const agent = externalAgentOfToken(given, opts.registryHome);
     return agent ? { kind: 'external', agent } : null;
   };
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
-    const path = url.pathname;
-
-    const remote = req.socket.remoteAddress ?? '';
-    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-
+  /**
+   * Turn away what must never reach a handler, before any credential is looked at. Returns the refusal,
+   * or null to go on.
+   */
+  const screen = (req: IncomingMessage, path: string): { status: number; error: string } | null => {
     if (path.startsWith('/api/peer/')) {
-      // moved off the plaintext console onto the mutual-TLS peer port (ADR-028)
-      json(res, 404, { error: 'the peer API is served over mutual TLS on the peer port (ADR-028)' });
-      return;
+      // the peer API moved off this plaintext port onto the mutual-TLS peer port (ADR-028)
+      return { status: 404, error: 'the peer API is served over mutual TLS on the peer port (ADR-028)' };
     }
-
-    // the console is bound to 127.0.0.1; keep the check as defence in depth
-    if (!isLoopback) {
-      json(res, 403, { error: 'local console endpoints are loopback-only' });
-      return;
+    // bound to 127.0.0.1 anyway; checked again as defence in depth
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')) {
+      return { status: 403, error: 'local console endpoints are loopback-only' };
     }
-
     // ---- ADR-087: what a browser on some other page could send is turned away before anything else ----
     // no CORS, ever: a preflight finds nothing here, so no page can send the token header or a JSON body cross-origin
-    if (req.method === 'OPTIONS') {
-      json(res, 404, { error: 'not found' });
-      return;
-    }
+    if (req.method === 'OPTIONS') return { status: 404, error: 'not found' };
     // the Host must be this server's own loopback name and port (DNS rebinding: a page on evil.example whose
     // name was re-pointed at 127.0.0.1 still says `Host: evil.example`)
     const host = (req.headers.host ?? '').toLowerCase();
-    if (!ownHosts.has(host)) {
-      json(res, 403, { error: FORBIDDEN });
-      return;
-    }
+    if (!ownHosts.has(host)) return { status: 403, error: FORBIDDEN };
     // an Origin header means a browser: only this server's own page may talk to it (the `morse` command sends none)
     const origin = req.headers.origin;
-    if (origin !== undefined && origin !== `http://${host}`) {
-      json(res, 403, { error: FORBIDDEN });
-      return;
-    }
+    if (origin !== undefined && origin !== `http://${host}`) return { status: 403, error: FORBIDDEN };
     const site = req.headers['sec-fetch-site'];
-    if (site !== undefined && site !== 'same-origin' && site !== 'none') {
-      json(res, 403, { error: FORBIDDEN });
-      return;
+    if (site !== undefined && site !== 'same-origin' && site !== 'none') return { status: 403, error: FORBIDDEN };
+    return null;
+  };
+
+  function ping({ req }: RequestContext): Reply {
+    // the liveness probe: says that a Morse daemon listens here, and nothing else.
+    // (ADR-087 follow-up 2) A command proves to itself that the listener is ITS home's daemon before it presents
+    // the token: it sends a random challenge and gets back HMAC(token, challenge) — which only the process
+    // that holds this home's token can compute, and which gives nothing of the token away.
+    const challenge = req.headers[PING_CHALLENGE_HEADER];
+    const proof = typeof challenge === 'string' && /^[0-9a-f]{32,128}$/.test(challenge) ? createHmac('sha256', opts.token).update(challenge).digest('hex') : null;
+    return reply(200, { morse: true, ...(proof ? { proof } : {}) });
+  }
+
+  function consolePage({ res }: RequestContext): Reply {
+    // static: the page holds no data and no secret — it asks for both with a console session.
+    // Read on every request, so an updated install serves its new page without a restart.
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    });
+    res.end(readFileSync(CONSOLE_PAGE, 'utf8'));
+  }
+
+  function consoleCode(): Reply {
+    // `morse console`: a one-time code the page it opens trades for a session (60 s, single use)
+    return reply(201, { code: consoleCodes.issue(), expiresInMs: consoleCodes.ttlMs });
+  }
+
+  async function consoleSession({ body }: RequestContext): Promise<Reply> {
+    const { code } = await body<{ code?: unknown }>();
+    if (typeof code !== 'string' || !code || !consoleCodes.redeem(code)) return reply(401, { error: UNAUTHORIZED });
+    return reply(201, { token: consoleSessions.issue(), expiresInMs: consoleSessions.ttlMs });
+  }
+
+  function shutdown({ afterReply }: RequestContext): Reply {
+    if (!opts.shutdown) return reply(404, { error: 'not found' });
+    afterReply(opts.shutdown.run);
+    return reply(202, { ok: true, pid: process.pid });
+  }
+
+  async function sessions({ url, external }: RequestContext): Promise<Reply> {
+    const all = await opts.directory();
+    if (!external) return reply(200, { sessions: narrowSessions(all, url.searchParams) });
+    // (ADR-087 follow-up 1) an external agent gets what it needs to NAME a target — `@<agent>:<part of the
+    // title>` — and nothing else: no session id, no directory. A search matches the TITLE only (ADR-089: it
+    // used to match the project folder's name too — a way to learn, by asking, what the folders of sessions
+    // are called, which the answer itself never shows), and the list is always bounded.
+    const q = url.searchParams.get('q')?.toLowerCase() ?? '';
+    const agent = url.searchParams.get('agent')?.toLowerCase() ?? '';
+    const limit = limitParam(url.searchParams, 50)!;
+    const sessions = all
+      .filter((x) => (!agent || x.agent === agent) && (!q || x.title.toLowerCase().includes(q)))
+      .slice(0, limit)
+      .map((x) => ({ agent: x.agent, title: x.title, lastActiveAt: x.lastActiveAt, ...(x.device ? { device: x.device } : {}) }));
+    return reply(200, { sessions });
+  }
+
+
+  function peers(): Reply {
+    // (ADR-081 review N1) `capabilities`: what a command may rely on before it posts — a daemon of the release
+    // before answers without it, and `morse send --from` then hands it nothing
+    const capabilities = DAEMON_CAPABILITIES;
+    const peering = opts.peering;
+    if (!peering) return reply(200, { lan: false, self: null, peers: [], capabilities });
+    const self = { device: peering.selfDevice, id: peering.selfId };
+    const trusted = peering.trust?.list() ?? [];
+    const relay = peering.relay?.() ?? null;
+    // relay only (Morse, --no-lan): no LAN discovery, but the paired devices and their tiers
+    if (!peering.peers) return reply(200, { lan: false, self, peers: [], trusted, relay, capabilities });
+    const peers = peering.peers().map((p) => {
+      const pairedAs = p.id ? peering.trust?.get(p.id) : undefined;
+      return { ...p, paired: Boolean(pairedAs), ...(pairedAs ? { trustedName: pairedAs.name } : {}) };
+    });
+    return reply(200, { lan: true, self, peers, trusted, pending: peering.pending?.() ?? [], relay, capabilities });
+  }
+
+
+
+  function transfer({ param }: RequestContext): Reply {
+    // ADR-038: how far an outgoing message (and its chunked files) is
+    const id = decodeURIComponent(param());
+    const message = opts.mailbox.getMessage(id);
+    if (!message) return reply(404, { error: 'no such message' });
+    return reply(200, { message, transfer: opts.transferStatus?.(id) ?? null });
+  }
+
+
+  async function messages({ body, caller }: RequestContext): Promise<Reply> {
+    const input = await body<{ from?: unknown; to?: unknown; text?: unknown; conversationId?: unknown }>();
+    const { from, to, text } = input;
+    if (!looksLikeSessionRef(from) || !looksLikeSessionRef(to) || typeof text !== 'string' || text.trim() === '') {
+      return reply(400, { error: MESSAGES_USAGE });
     }
+    // (ADR-087 follow-up 4) the web console wires sessions on THIS computer together: a console session names no
+    // other device or address — mail to a contact is `morse send`'s, which the owner runs in a terminal
+    if (caller?.kind === 'console' && (to.device !== undefined || from.device !== undefined)) {
+      return reply(403, { error: 'the web console sends between sessions here only — for another address use: morse send' });
+    }
+    // a local target is checked first (ADR-025); one on another device by its own daemon when it arrives
+    if (!to.device && opts.preflight) {
+      const session = (await opts.directory()).find((s) => !s.device && s.agent === to.agent && s.sessionId === to.sessionId);
+      const refusal = session ? await opts.preflight(session) : null;
+      if (refusal) return reply(409, { error: refusal, code: refusalCode(refusal) });
+    }
+    const conversationId = typeof input.conversationId === 'string' && input.conversationId ? input.conversationId : undefined;
+    const message = opts.mailbox.send({ from, to, text, via: 'webui', ...(conversationId ? { conversationId } : {}) });
+    changed();
+    // (ADR-081 review N1) like /api/send: the address of ours an outbound message goes out from ('' = the first)
+    return reply(201, { message, ...(message.to.device ? { sentFrom: message.myAddress ?? '' } : {}) });
+  }
+
+  async function accepted({ body }: RequestContext): Promise<Reply> {
+    const input = await body<{ handle?: unknown; deviceId?: unknown; myAddress?: unknown }>();
+    if (typeof input.handle !== 'string' || !input.handle.trim() || typeof input.deviceId !== 'string') {
+      return reply(400, { error: 'expected {handle, deviceId}' });
+    }
+    if (!opts.notifyAccepted) return reply(404, { error: NO_RELAY });
+    let told: number;
+    try {
+      // (ADR-083) `myAddress`: which address of ours accepted ('' = the first) — a command of the release before sends none
+      told = await opts.notifyAccepted(input.handle, input.deviceId, typeof input.myAddress === 'string' ? input.myAddress : undefined);
+    } catch (e) {
+      return reply(409, { error: e instanceof Error ? e.message : String(e) });
+    }
+    changed();
+    return reply(200, { ok: true, told });
+  }
+
+  function retry({ param }: RequestContext): Reply {
+    // a refusal (not failed / dead, unknown id) comes back as the generic 500 with its message
+    const message = opts.mailbox.retry(param());
+    changed();
+    return reply(200, { message });
+  }
+
+  function addressesReload(): Reply {
+    if (!opts.reloadAddresses) return reply(404, { error: NO_RELAY });
+    return reply(200, { ok: true, ...opts.reloadAddresses() });
+  }
+
+  function events({ req, res }: RequestContext): Reply {
+    streams.attach(req, res);
+  }
+
+  /**
+   * POST /api/register and POST /api/inbox (ADR-024). Desktop apps such as 闪电说 cannot run `morse` (a bare
+   * PATH, a sandbox that forbids writing ~/.morse), so they register and pull their mail over loopback HTTP.
+   * /api/register always registers; /api/inbox registers only when the body says `register: true`, so one
+   * call can register, refresh lastSeenAt and collect mail.
+   */
+  async function externalMail({ body, external }: RequestContext, route: 'register' | 'inbox'): Promise<Reply> {
+    const input = await body<{ agent?: string; sessionId?: string; title?: string; cwd?: string; register?: boolean }>();
+    const sessionId = input.sessionId;
+    if (typeof sessionId !== 'string' || !sessionId.trim()) return reply(400, { error: REGISTER_USAGE });
+    const registry = await import('../registry/external.js');
+    // (ADR-087, follow-up 1) an external agent's token registers and reads as THAT agent, for the session ids the
+    // token is BOUND to — never by what the body says. (Before the follow-up, registering counted as owning:
+    // `{agent: <itself>, sessionId: <any session's id>, register: true}` then read that session's mail.)
+    if (external) {
+      const sid = sessionId;
+      const asItself = typeof input.agent !== 'string' || input.agent.trim().toLowerCase() === external;
+      const binding = externalBinding(external, opts.registryHome);
+      if (!asItself || !binding || sid.length > MAX_EXTERNAL_SESSION_ID) return reply(403, { error: FORBIDDEN });
+      if (!binding.sessions.includes(sid)) {
+        // an app that names its own session id (`open`) may bind itself to one that is NOBODY ELSE'S: not a
+        // session of any agent here, not another app's, not one any mail was ever addressed to under another
+        // agent's name, not one of the mailbox's own names
+        const reserved = ['inbox', 'cli', 'web', 'user'].includes(sid.trim().toLowerCase()) || sid !== sid.trim();
+        const free =
+          binding.open &&
+          !reserved &&
+          !registry.listRegistered({ ...homeOpt, includeStale: true }).some((r) => r.sessionId === sid && r.agent !== external) &&
+          !(await opts.directory()).some((x) => x.sessionId === sid && x.agent !== external) &&
+          !opts.mailbox.inbox({ toSession: sid, all: true }).some((m) => m.to.agent !== external);
+        if (!free) return reply(403, { error: FORBIDDEN });
+        bindExternalSession(external, sid, opts.registryHome);
+      }
+      input.agent = external; // (it registers as itself, whether or not it said so)
+    }
+
+    if (route === 'register' || input.register) {
+      if (typeof input.agent !== 'string') return reply(400, { error: REGISTER_USAGE });
+      const entry = { agent: input.agent, sessionId, ...(input.title ? { title: input.title } : {}), ...(input.cwd ? { cwd: input.cwd } : {}) };
+      let session: ReturnType<typeof registry.register>;
+      try {
+        session = registry.register(entry, homeOpt);
+      } catch (e) {
+        return reply(400, { error: e instanceof Error ? e.message : String(e) });
+      }
+      opts.invalidateDirectory?.();
+      if (route === 'register') {
+        changed();
+        return reply(201, { session, registered: registry.listRegistered(homeOpt).length });
+      }
+    }
+
+    // The prompt hook's collector does the pull, so an app gets the same dead-letter recovery (ADR-022) and a
+    // ready-to-read `text`. What it took is told apart by status: delivered now, and not before the call.
+    const { collectInbox: pull } = await import('../hooks/prompt-hook.js');
+    // (follow-up 1) for an external agent the mail is that of (its agent name, this session) — a session id alone
+    // never selects mail addressed to another agent
+    const query = { toSession: sessionId, all: true, ...(external ? { toAgent: external } : {}) };
+    const deliveredBefore = new Set(opts.mailbox.inbox(query).flatMap((m) => (m.status === 'delivered' ? [m.id] : [])));
+    const text = pull(opts.mailbox, sessionId, { ...homeOpt, ...(external ? { agent: external } : {}) });
+    const messages = opts.mailbox.inbox(query).filter((m) => m.status === 'delivered' && !deliveredBefore.has(m.id));
+    changed();
+    return reply(201, { count: messages.length, text, messages });
+  }
+
+  /** POST /api/send — what `morse send` posts: resolve the target, check it, queue the message. */
+  async function handleSend({ body, external }: RequestContext): Promise<Reply> {
+    const input = await body<{ target?: string; from?: SessionRef; text?: string; files?: unknown; fromAddress?: unknown }>();
+    const { target, text } = input;
+    if (typeof target !== 'string' || typeof text !== 'string' || text.trim() === '') {
+      return reply(400, { error: 'expected {target, from?, text, files?, fromAddress?}' });
+    }
+    // (ADR-087) an external agent sends as itself, text only: it names no file on this disk to attach and no
+    // address of the owner's to send from
+    if (
+      external &&
+      (!looksLikeSessionRef(input.from) ||
+        input.from.agent !== external ||
+        input.from.device !== undefined ||
+        input.files !== undefined ||
+        input.fromAddress !== undefined ||
+        // (follow-up 1) …and from a session its token is bound to
+        !externalBinding(external, opts.registryHome)?.sessions.includes(input.from.sessionId))
+    ) {
+      return reply(403, { error: FORBIDDEN });
+    }
+    const [sessions, { resolveTarget }, { parseMorseAddress, hasRelayHost, INBOX_AGENT, OLD_NAMES_LINE }, { normalizeAddress }, { contactsOfTarget }] = await Promise.all([
+      opts.directory(),
+      import('../directory/resolve.js'),
+      import('../cluster/morse.js'),
+      import('../identity/address.js'),
+      import('../mailbox/known-as.js'),
+    ]);
+    // ADR-081 §6: the address of ours this is sent from (`morse send --from <name|address>`) — resolved to the
+    // ADDRESS here, when it is queued (ADR-081 review: legacy rows): the row records it, a name alone never is
+    const named = typeof input.fromAddress === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/i.test(input.fromAddress.trim()) ? input.fromAddress.trim().toLowerCase() : undefined;
+    /** The address of ours it goes out from, when one is named, remembered or resolved; its local name (display). */
+    let myAddress: string | undefined;
+    let myAgent: string | undefined;
+    if (named) {
+      const own = opts.ownAddress?.(named) ?? null;
+      myAddress = normalizeAddress(named) ?? own?.address;
+      if (!myAddress) return reply(422, { error: `"${named}" is not one of your addresses here — morse address lists them` });
+      // (ADR-088) the row keeps the directory's name for the address — stable, the same as on the rows of mail that
+      // came in; the name you gave it is looked up from the address when a row is shown
+      myAgent = own?.directory ?? own?.name ?? undefined;
+    }
+    // (ADR-083) WHICH contact this is: a person can be a contact of several of my addresses — separate rows
+    // that share nothing. With an address named: that address's contact (made by this very message when
+    // there is none). With none named: the contact there is, sent from the address it belongs to; a peer
+    // address that is a contact of two of mine is refused with one line — never guessed.
+    {
+      const contacts = opts.mailbox.contacts;
+      const nameFor = (key: string): string => {
+        const a = key || contacts.firstAddress();
+        return (a ? opts.ownAddress?.(a)?.name : null) ?? (a ? `morse.im/${a}` : 'your first address');
+      };
+      const persons = contactsOfTarget(contacts, target, (h) => Boolean(opts.knowsDevice?.(h)));
+      const peer = normalizeAddress(target);
+      if (persons && myAddress && contacts.mine(myAddress) && !peer) {
+        // a contact by old name is the first address's alone: another address of mine never writes to an old name —
+        // and the way out is the address they belong to, never "write to their address from the other one" (that
+        // makes them a contact of it too, and shows them that address)
+        const firstName = nameFor('');
+        return reply(422, {
+          error: `${target} is a contact of your first address, by its old name, not of ${nameFor(contacts.mine(myAddress))} — write to them from the address they belong to: ${firstName === 'your first address' ? '' : `--from ${firstName.replace(/^morse\.im\//, '')}, or `}leave --from out`,
+        });
+      }
+      if (persons && !myAddress && persons.length > 1) {
+        return reply(422, { error: `morse.im/${peer ?? target} is a contact of ${persons.length} of your addresses (${persons.map((c) => nameFor(c.myAddress)).join(', ')}) — say which one: --from <name>` });
+      }
+      if (persons && !myAddress && persons.length === 1 && persons[0]!.myAddress) {
+        myAddress = persons[0]!.myAddress;
+        const owning = opts.ownAddress?.(myAddress);
+        myAgent = owning?.directory ?? owning?.name ?? undefined;
+      }
+    }
+    // ADR-081 §2: a bare address (or mail from an address of ours other than the first) goes by address
+    // alone — asked before anything is queued, so "their Morse is too old" is said here, once
+    let byAddress: string | null = null;
+    if (opts.addressRoute) {
+      const route = await opts.addressRoute(target, myAddress ?? null);
+      if (route && !route.ok && !route.waiting) return reply(422, { error: route.error });
+      // (ADR-091) the address the transport goes to — a contact's, when `target` named it by its remark or old name
+      byAddress = route?.ok ? route.address : route ? normalizeAddress(target) : null;
+      // (ADR-081 review F1) a bare address with nothing named: the address the transport sends it from
+      if (route?.ok && route.from && !myAddress) myAddress = route.from;
+    }
+    // Morse first: a paired PERSON (morse.im/<handle>[/<agent>]) beats any local
+    // session that happens to share the name
+    const person = byAddress ? null : parseMorseAddress(target);
+    // (ADR-091, stage 2) an old name (morse.im/<handle>[/<agent>]) no address is known for reaches nobody any more: one
+    // line, nothing queued. A bare word that is no contact goes on to the sessions here.
+    if (person && !opts.pairPerson && (hasRelayHost(target) || target.includes('/'))) return reply(422, { error: OLD_NAMES_LINE(target) });
+    let isPerson = Boolean(person && opts.knowsDevice?.(person.handle));
+    if (person && !isPerson && opts.pairPerson && hasRelayHost(target)) {
+      // morse.im/<handle> spelled out and nobody paired yet: first contact pairs them (ADR-032)
+      const p = await opts.pairPerson(person.handle);
+      if (!p.ok && !p.waiting) return reply(422, { error: p.error ?? `cannot reach ${target}` });
+      isPerson = true; // paired now, or queued until the relay is back (the transport retries the lookup)
+    }
+    let local = isPerson || byAddress ? null : resolveTarget(target, sessions);
+    if (local && !local.ok && person && opts.pairPerson && local.reason === 'not_found') {
+      // a bare name that is no local session: maybe a person on the relay
+      const p = await opts.pairPerson(person.handle);
+      if (p.ok) local = null;
+    }
+
+    /** A target with no session directory here: the device and agent are all there is. */
+    const remote = (device: string, agent: string, sessionId: string, title: string): SessionInfo => ({ device, agent, sessionId, title, cwd: '', lastActiveAt: 0 });
+    let resolved: SessionInfo;
+    if (byAddress) {
+      // the address is all there is to say: no agent name, no session (an address IS its agent). Writing
+      // to it accepts it (ADR-037): it is a contact from here on, a request of theirs moves to the inbox
+      opts.acceptAddress?.(byAddress, myAddress ?? null);
+      resolved = remote(byAddress, INBOX_AGENT, '', 'inbox');
+    } else if (local === null) {
+      // person-level: their inbox; agent-level: that agent's session is picked on THEIR machine
+      const agent = person!.agent ?? INBOX_AGENT;
+      resolved = remote(person!.handle, agent, '', person!.agent ? agent : 'inbox');
+    } else if (local.ok) {
+      resolved = local.session;
+    } else {
+      // Morse: a relay-paired device has no directory here — accept an explicit
+      // @device/agent:session address for it as-is
+      const spelled = /^@?([^/\s]+)\/([^:\s]+):(\S+)$/.exec(target.trim());
+      if (!spelled || !opts.knowsDevice?.(spelled[1]!)) {
+        return reply(422, { error: `cannot resolve target "${target}" (${local.reason})`, candidates: local.candidates.slice(0, 8) });
+      }
+      resolved = remote(spelled[1]!, spelled[2]!, spelled[3]!, spelled[3]!);
+    }
+
+    const to: SessionRef = resolved.device
+      ? { agent: resolved.agent, sessionId: resolved.sessionId, device: resolved.device }
+      : { agent: resolved.agent, sessionId: resolved.sessionId };
+    // without a sender the message comes from the human at the command line
+    const from: SessionRef = looksLikeSessionRef(input.from) ? input.from : { agent: 'user', sessionId: 'cli' };
+    // only a local target is checked here; a remote one by the daemon that owns it, at delivery
+    if (!to.device && opts.preflight) {
+      const refusal = await opts.preflight(resolved);
+      if (refusal) return reply(409, { error: refusal, code: refusalCode(refusal), resolvedTarget: resolved });
+    }
+    let files: MessageFile[] = [];
+    if (Array.isArray(input.files) && input.files.length) {
+      if (!to.device || !opts.stageFiles) return reply(400, { error: 'files can only be sent to another address over the Morse relay' });
+      try {
+        files = opts.stageFiles(input.files.filter((f): f is string => typeof f === 'string'));
+      } catch (e) {
+        return reply(400, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    const message = opts.mailbox.send({ from, to, text, via: 'cli', ...(files.length ? { files } : {}), ...(myAddress && to.device ? { myAddress, ...(myAgent ? { myAgent } : {}) } : {}) });
+    changed();
+    const chunks = files.length && opts.chunksFor ? opts.chunksFor(files, text) : 0;
+    // (ADR-081 review N1) `sentFrom`: the address of ours the message goes out from as the row records it — '' = none
+    // was named or remembered: this computer's first address. (Mail for a session here records none: the
+    // one that was named is echoed.) A daemon of the release before sends no such field.
+    return reply(201, { message, resolvedTarget: resolved, sentFrom: to.device ? (message.myAddress ?? '') : (myAddress ?? ''), ...(chunks ? { chunks } : {}) });
+  }
+
+  /**
+   * Screen, authenticate, route and answer one request. Every route of LOCAL_API_ROUTES is dispatched by its
+   * name below, and only by its name: no handler looks at the path or the method itself (ADR-087).
+   */
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
+    const path = url.pathname;
+    const refusal = screen(req, path);
+    if (refusal) return sendJson(res, refusal.status, { error: refusal.error });
 
     const route = LOCAL_API_ROUTES.find((r) => r.method === req.method && (typeof r.path === 'string' ? r.path === path : r.path.test(path)));
     const open = route !== undefined && (route.auth as readonly LocalApiAuth[]).includes('none');
     const caller = open ? null : callerOf(req);
-    if (!open && !caller) {
-      // (asked before the route is: an unauthenticated caller does not learn which paths exist)
+    // (who is asked before what: an unauthenticated caller does not learn which paths exist)
+    const turnAway = !open && !caller ? { status: 401, error: UNAUTHORIZED } : !route ? { status: 404, error: 'not found' } : caller && !(route.auth as readonly LocalApiAuth[]).includes(caller.kind) ? { status: 403, error: FORBIDDEN } : null;
+    if (turnAway || !route) {
       req.resume();
-      json(res, 401, { error: UNAUTHORIZED });
-      return;
+      return sendJson(res, turnAway?.status ?? 404, { error: turnAway?.error ?? 'not found' });
     }
-    if (!route) {
-      req.resume();
-      json(res, 404, { error: 'not found' });
-      return;
-    }
-    if (caller && !(route.auth as readonly LocalApiAuth[]).includes(caller.kind)) {
-      req.resume();
-      json(res, 403, { error: FORBIDDEN });
-      return;
-    }
-    /** The route this request is for — the only thing the handlers below go by. */
+
+    let bodyRead = false;
+    let after: (() => void) | undefined;
+    const ctx: RequestContext = {
+      req,
+      res,
+      url,
+      caller,
+      external: caller?.kind === 'external' ? caller.agent : null,
+      param: () => (route.path as RegExp).exec(path)![1]!,
+      body: async <T>() => {
+        bodyRead = true;
+        return (await readJsonBody(req)) as T;
+      },
+      afterReply: (fn) => {
+        after = fn;
+      },
+    };
+
     const name: LocalApiRouteName = route.name;
-    /** The part of the path a route with a pattern captures (a message or conversation id). */
-    const param = (): string => (route.path as RegExp).exec(path)![1]!;
-    /** (ADR-087) an external agent acts as itself only */
-    const external = caller?.kind === 'external' ? caller.agent : null;
+    let answer: Reply;
+    if (name === 'ping') answer = ping(ctx);
+    else if (name === 'consolePage') answer = consolePage(ctx);
+    else if (name === 'consoleCode') answer = consoleCode();
+    else if (name === 'consoleSession') answer = await consoleSession(ctx);
+    else if (name === 'shutdown') answer = shutdown(ctx);
+    else if (name === 'sessions') answer = await sessions(ctx);
+    else if (name === 'register' || name === 'inbox') answer = await externalMail(ctx, name);
+    else if (name === 'peers') answer = peers();
+    else if (name === 'conversations') answer = reply(200, { conversations: opts.mailbox.listConversations() });
+    else if (name === 'conversationMessages') answer = reply(200, { messages: opts.mailbox.listMessages(ctx.param()) });
+    else if (name === 'send') answer = await handleSend(ctx);
+    else if (name === 'transfer') answer = transfer(ctx);
+    // ADR-039: `morse update` asks before it installs (a transfer in progress defers it)
+    else if (name === 'update') answer = reply(200, opts.updateStatus?.() ?? { busy: null });
+    else if (name === 'messages') answer = await messages(ctx);
+    else if (name === 'accepted') answer = await accepted(ctx);
+    else if (name === 'retry') answer = retry(ctx);
+    else if (name === 'addressesReload') answer = addressesReload();
+    else if (name === 'events') answer = events(ctx);
+    else {
+      // (every name of LOCAL_API_ROUTES has its branch above: this one is not reached)
+      name satisfies never;
+      answer = reply(404, { error: 'not found' });
+    }
 
-    if (name === 'ping') {
-      // the liveness probe: says that a Morse daemon listens here, and nothing else.
-      // (ADR-087 follow-up 2) A command proves to itself that the listener is ITS home's daemon before it presents
-      // the token: it sends a random challenge and gets back HMAC(token, challenge) — which only the process
-      // that holds this home's token can compute, and which gives nothing of the token away.
-      const challenge = req.headers[PING_CHALLENGE_HEADER];
-      const proof = typeof challenge === 'string' && /^[0-9a-f]{32,128}$/.test(challenge) ? createHmac('sha256', opts.token).update(challenge).digest('hex') : null;
-      json(res, 200, { morse: true, ...(proof ? { proof } : {}) });
-      return;
-    }
-    if (name === 'consolePage') {
-      // static: the page holds no data and no secret — it asks for both with a console session
-      res.writeHead(200, {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff',
-        'x-frame-options': 'DENY',
-        'referrer-policy': 'no-referrer',
-        'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-      });
-      res.end(readFileSync(webuiFile, 'utf8'));
-      return;
-    }
-    if (name === 'consoleCode') {
-      // `morse console`: a one-time code the page it opens trades for a session (60 s, single use)
-      req.resume();
-      sweep(consoleCodes);
-      const code = randomBytes(24).toString('hex');
-      consoleCodes.set(code, Date.now() + CONSOLE_CODE_TTL_MS);
-      json(res, 201, { code, expiresInMs: CONSOLE_CODE_TTL_MS });
-      return;
-    }
-    if (name === 'consoleSession') {
-      const body = (await readBody(req)) as { code?: unknown };
-      sweep(consoleCodes);
-      let hit: string | null = null;
-      if (typeof body.code === 'string' && body.code) for (const c of consoleCodes.keys()) if (sameToken(body.code, c)) hit = c;
-      if (!hit) {
-        json(res, 401, { error: UNAUTHORIZED });
-        return;
-      }
-      consoleCodes.delete(hit);
-      const token = randomBytes(24).toString('hex');
-      consoleSessions.set(token, Date.now() + CONSOLE_SESSION_TTL_MS);
-      json(res, 201, { token, expiresInMs: CONSOLE_SESSION_TTL_MS });
-      return;
-    }
-    if (name === 'shutdown') {
-      if (!opts.shutdown) {
-        json(res, 404, { error: 'not found' });
-        return;
-      }
-      req.resume();
-      json(res, 202, { ok: true, pid: process.pid });
-      const { run } = opts.shutdown;
-      setImmediate(run);
-      return;
-    }
-    if (name === 'sessions') {
-      if (external) {
-        // (ADR-087 follow-up 1) an external agent gets what it needs to NAME a target — `@<agent>:<part of the
-        // title>` — and nothing else: no session id, no directory. A search matches the TITLE only (ADR-089: it
-        // used to match the project folder's name too — a way to learn, by asking, what the folders of sessions
-        // are called, which the answer itself never shows), and the list is always bounded.
-        const q = url.searchParams.get('q')?.toLowerCase() ?? '';
-        const agent = url.searchParams.get('agent')?.toLowerCase() ?? '';
-        const rawLimit = Number.parseInt(url.searchParams.get('limit') ?? '', 10);
-        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 50;
-        const sessions = (await opts.directory())
-          .filter((x) => (!agent || x.agent === agent) && (!q || x.title.toLowerCase().includes(q)))
-          .slice(0, limit)
-          .map((x) => ({ agent: x.agent, title: x.title, lastActiveAt: x.lastActiveAt, ...(x.device ? { device: x.device } : {}) }));
-        json(res, 200, { sessions });
-        return;
-      }
-      json(res, 200, { sessions: filterSessions(await opts.directory(), url.searchParams) });
-      return;
-    }
-    // ADR-024: external agents (desktop Apps like 闪电说) cannot run `morse` — a
-    // minimal PATH plus a sandbox that blocks writes to ~/.morse. They register
-    // and pull over loopback HTTP instead, which the sandbox does not restrict.
-    if (name === 'register' || name === 'inbox') {
-      const body = (await readBody(req)) as {
-        agent?: string;
-        sessionId?: string;
-        title?: string;
-        cwd?: string;
-        register?: boolean;
-      };
-      const isInbox = name === 'inbox';
-      if (typeof body.sessionId !== 'string' || !body.sessionId.trim()) {
-        json(res, 400, { error: 'expected {agent, sessionId, title?, cwd?}' });
-        return;
-      }
-      const { register, listRegistered } = await import('../registry/external.js');
-      const homeOpt = opts.registryHome ? { home: opts.registryHome } : {};
-      // (ADR-087, follow-up 1) an external agent's token registers and reads as THAT agent, for the session ids the
-      // token is BOUND to — never by what the body says. (Before the follow-up, registering counted as owning:
-      // `{agent: <itself>, sessionId: <any session's id>, register: true}` then read that session's mail.)
-      if (external) {
-        const sid = body.sessionId;
-        const asItself = typeof body.agent !== 'string' || body.agent.trim().toLowerCase() === external;
-        const binding = externalBinding(external, opts.registryHome);
-        if (!asItself || !binding || sid.length > MAX_EXTERNAL_SESSION_ID) {
-          json(res, 403, { error: FORBIDDEN });
-          return;
-        }
-        if (!binding.sessions.includes(sid)) {
-          // an app that names its own session id (`open`) may bind itself to one that is NOBODY ELSE'S: not a
-          // session of any agent here, not another app's, not one any mail was ever addressed to under another
-          // agent's name, not one of the mailbox's own names
-          const reserved = ['inbox', 'cli', 'web', 'user'].includes(sid.trim().toLowerCase()) || sid !== sid.trim();
-          const free =
-            binding.open &&
-            !reserved &&
-            !listRegistered({ ...homeOpt, includeStale: true }).some((r) => r.sessionId === sid && r.agent !== external) &&
-            !(await opts.directory()).some((x) => x.sessionId === sid && x.agent !== external) &&
-            !opts.mailbox.inbox({ toSession: sid, all: true }).some((m) => m.to.agent !== external);
-          if (!free) {
-            json(res, 403, { error: FORBIDDEN });
-            return;
-          }
-          bindExternalSession(external, sid, opts.registryHome);
-        }
-        body.agent = external; // (it registers as itself, whether or not it said so)
-      }
-
-      // /api/register always registers; /api/inbox only when asked — so one call
-      // can register, refresh lastSeenAt and collect mail together.
-      if (!isInbox || body.register) {
-        if (typeof body.agent !== 'string') {
-          json(res, 400, { error: 'expected {agent, sessionId, title?, cwd?}' });
-          return;
-        }
-        let session;
-        try {
-          session = register(
-            {
-              agent: body.agent,
-              sessionId: body.sessionId,
-              ...(body.title ? { title: body.title } : {}),
-              ...(body.cwd ? { cwd: body.cwd } : {}),
-            },
-            homeOpt,
-          );
-        } catch (e) {
-          json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-          return;
-        }
-        opts.invalidateDirectory?.();
-        if (!isInbox) {
-          broadcast();
-          json(res, 201, { session, registered: listRegistered(homeOpt).length });
-          return;
-        }
-      }
-
-      // Reuses the pull-hook collector, so external agents inherit dead-letter
-      // recovery (ADR-022) for free. `text` is render-ready for the agent to read out.
-      const { collectInbox } = await import('../hooks/prompt-hook.js');
-      // (follow-up 1) for an external agent the mail is that of (its agent name, this session) — a session id alone
-      // never selects mail addressed to another agent
-      const mine = external ? { toAgent: external } : {};
-      const messages = opts.mailbox.inbox({ toSession: body.sessionId, all: true, ...mine });
-      const before = new Set(messages.filter((m) => m.status === 'delivered').map((m) => m.id));
-      const text = collectInbox(opts.mailbox, body.sessionId, { ...homeOpt, ...(external ? { agent: external } : {}) });
-      const collected = opts.mailbox
-        .inbox({ toSession: body.sessionId, all: true, ...mine })
-        .filter((m) => m.status === 'delivered' && !before.has(m.id));
-      broadcast();
-      json(res, 201, { count: collected.length, text, messages: collected });
-      return;
-    }
-    if (name === 'peers') {
-      // (ADR-081 review N1) `capabilities`: what a command may rely on before it posts — a daemon of the release
-      // before answers without it, and `morse send --from` then hands it nothing
-      const capabilities = DAEMON_CAPABILITIES;
-      if (!opts.peering) {
-        json(res, 200, { lan: false, self: null, peers: [], capabilities });
-        return;
-      }
-      if (!opts.peering.peers) {
-        // relay-only (Morse, --no-lan): no LAN discovery, but paired devices + tiers
-        json(res, 200, {
-          lan: false,
-          self: { device: opts.peering.selfDevice, id: opts.peering.selfId },
-          peers: [],
-          trusted: opts.peering.trust?.list() ?? [],
-          relay: opts.peering.relay?.() ?? null,
-          capabilities,
-        });
-        return;
-      }
-      const trust = opts.peering.trust;
-      const peers = (opts.peering.peers?.() ?? []).map((p) => {
-        const trusted = p.id ? trust?.get(p.id) : undefined;
-        return { ...p, paired: Boolean(trusted), ...(trusted ? { trustedName: trusted.name } : {}) };
-      });
-      json(res, 200, {
-        lan: true,
-        self: { device: opts.peering.selfDevice, id: opts.peering.selfId },
-        peers,
-        trusted: trust?.list() ?? [],
-        pending: opts.peering.pending?.() ?? [],
-        relay: opts.peering.relay?.() ?? null,
-        capabilities,
-      });
-      return;
-    }
-    if (name === 'conversations') {
-      json(res, 200, { conversations: opts.mailbox.listConversations() });
-      return;
-    }
-    if (name === 'conversationMessages') {
-      json(res, 200, { messages: opts.mailbox.listMessages(param()) });
-      return;
-    }
-    if (name === 'send') {
-      const body = (await readBody(req)) as { target?: string; from?: SessionRef; text?: string; files?: unknown; fromAddress?: unknown };
-      if (typeof body.target !== 'string' || typeof body.text !== 'string' || !body.text.trim()) {
-        json(res, 400, { error: 'expected {target, from?, text, files?, fromAddress?}' });
-        return;
-      }
-      // (ADR-087) an external agent sends as itself, text only: it names no file on this disk to attach and no
-      // address of the owner's to send from
-      if (
-        external &&
-        (!isSessionRef(body.from) ||
-          body.from.agent !== external ||
-          body.from.device !== undefined ||
-          body.files !== undefined ||
-          body.fromAddress !== undefined ||
-          // (follow-up 1) …and from a session its token is bound to
-          !externalBinding(external, opts.registryHome)?.sessions.includes(body.from.sessionId))
-      ) {
-        json(res, 403, { error: FORBIDDEN });
-        return;
-      }
-      const { resolveTarget } = await import('../directory/resolve.js');
-      const { parseMorseAddress, hasRelayHost, INBOX_AGENT, OLD_NAMES_LINE } = await import('../cluster/morse.js');
-      const { normalizeAddress } = await import('../identity/address.js');
-      const sessions = await opts.directory();
-      const { contactsOfTarget } = await import('../mailbox/known-as.js');
-      // ADR-081 §6: the address of ours this is sent from (`morse send --from <name|address>`) — resolved to the
-      // ADDRESS here, when it is queued (ADR-081 review: legacy rows): the row records it, a name alone never is
-      const named = typeof body.fromAddress === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/i.test(body.fromAddress.trim()) ? body.fromAddress.trim().toLowerCase() : undefined;
-      /** The address of ours it goes out from, when one is named, remembered or resolved; its local name (display). */
-      let myAddress: string | undefined;
-      let myAgent: string | undefined;
-      if (named) {
-        const own = opts.ownAddress?.(named) ?? null;
-        myAddress = normalizeAddress(named) ?? own?.address;
-        if (!myAddress) {
-          json(res, 422, { error: `"${named}" is not one of your addresses here — morse address lists them` });
-          return;
-        }
-        // (ADR-088) the row keeps the directory's name for the address — stable, the same as on the rows of mail that
-        // came in; the name you gave it is looked up from the address when a row is shown
-        myAgent = own?.directory ?? own?.name ?? undefined;
-      }
-      // (ADR-083) WHICH contact this is: a person can be a contact of several of my addresses — separate rows
-      // that share nothing. With an address named: that address's contact (made by this very message when
-      // there is none). With none named: the contact there is, sent from the address it belongs to; a peer
-      // address that is a contact of two of mine is refused with one line — never guessed.
-      {
-        const contacts = opts.mailbox.contacts;
-        const nameFor = (key: string): string => {
-          const a = key || contacts.firstAddress();
-          return (a ? opts.ownAddress?.(a)?.name : null) ?? (a ? `morse.im/${a}` : 'your first address');
-        };
-        const persons = contactsOfTarget(contacts, body.target, (h) => Boolean(opts.knowsDevice?.(h)));
-        const peer = normalizeAddress(body.target);
-        if (persons && myAddress && contacts.mine(myAddress) && !peer) {
-          // a contact by old name is the first address's alone: another address of mine never writes to an old name —
-          // and the way out is the address they belong to, never "write to their address from the other one" (that
-          // makes them a contact of it too, and shows them that address)
-          const firstName = nameFor('');
-          json(res, 422, {
-            error: `${body.target} is a contact of your first address, by its old name, not of ${nameFor(contacts.mine(myAddress))} — write to them from the address they belong to: ${firstName === 'your first address' ? '' : `--from ${firstName.replace(/^morse\.im\//, '')}, or `}leave --from out`,
-          });
-          return;
-        }
-        if (persons && !myAddress && persons.length > 1) {
-          json(res, 422, { error: `morse.im/${peer ?? body.target} is a contact of ${persons.length} of your addresses (${persons.map((c) => nameFor(c.myAddress)).join(', ')}) — say which one: --from <name>` });
-          return;
-        }
-        if (persons && !myAddress && persons.length === 1 && persons[0]!.myAddress) {
-          myAddress = persons[0]!.myAddress;
-          const owning = opts.ownAddress?.(myAddress);
-          myAgent = owning?.directory ?? owning?.name ?? undefined;
-        }
-      }
-      // ADR-081 §2: a bare address (or mail from an address of ours other than the first) goes by address
-      // alone — asked before anything is queued, so "their Morse is too old" is said here, once
-      let byAddress: string | null = null;
-      if (opts.addressRoute) {
-        const route = await opts.addressRoute(body.target, myAddress ?? null);
-        if (route && !route.ok && !route.waiting) {
-          json(res, 422, { error: route.error });
-          return;
-        }
-        // (ADR-091) the address the transport goes to — a contact's, when `target` named it by its remark or old name
-        byAddress = route?.ok ? route.address : route ? normalizeAddress(body.target) : null;
-        // (ADR-081 review F1) a bare address with nothing named: the address the transport sends it from
-        if (route?.ok && route.from && !myAddress) myAddress = route.from;
-      }
-      // Morse first: a paired PERSON (morse.im/<handle>[/<agent>]) beats any local
-      // session that happens to share the name
-      const person = byAddress ? null : parseMorseAddress(body.target);
-      // (ADR-091, stage 2) an old name (morse.im/<handle>[/<agent>]) no address is known for reaches nobody any more: one
-      // line, nothing queued. A bare word that is no contact goes on to the sessions here.
-      if (person && !opts.pairPerson && (hasRelayHost(body.target) || body.target.includes('/'))) {
-        json(res, 422, { error: OLD_NAMES_LINE(body.target) });
-        return;
-      }
-      let isPerson = Boolean(person && opts.knowsDevice?.(person.handle));
-      if (person && !isPerson && opts.pairPerson && hasRelayHost(body.target)) {
-        // morse.im/<handle> spelled out and nobody paired yet: first contact pairs them (ADR-032)
-        const p = await opts.pairPerson(person.handle);
-        if (!p.ok && !p.waiting) {
-          json(res, 422, { error: p.error ?? `cannot reach ${body.target}` });
-          return;
-        }
-        isPerson = true; // paired now, or queued until the relay is back (the transport retries the lookup)
-      }
-      let r = isPerson || byAddress ? null : resolveTarget(body.target, sessions);
-      if (r && !r.ok && person && opts.pairPerson && r.reason === 'not_found') {
-        // a bare name that is no local session: maybe a person on the relay
-        const p = await opts.pairPerson(person.handle);
-        if (p.ok) r = null;
-      }
-      let resolved: SessionInfo;
-      if (byAddress) {
-        // the address is all there is to say: no agent name, no session (an address IS its agent). Writing
-        // to it accepts it (ADR-037): it is a contact from here on, a request of theirs moves to the inbox
-        opts.acceptAddress?.(byAddress, myAddress ?? null);
-        resolved = { device: byAddress, agent: INBOX_AGENT, sessionId: '', title: 'inbox', cwd: '', lastActiveAt: 0 };
-      } else if (!r) {
-        // person-level: their inbox; agent-level: that agent's session is picked on THEIR machine
-        const agent = person!.agent ?? INBOX_AGENT;
-        resolved = { device: person!.handle, agent, sessionId: '', title: person!.agent ? agent : 'inbox', cwd: '', lastActiveAt: 0 };
-      } else if (r.ok) {
-        resolved = r.session;
-      } else {
-        // Morse: a relay-paired device has no directory here — accept an explicit
-        // @device/agent:session address for it as-is
-        const raw = /^@?([^/\s]+)\/([^:\s]+):(\S+)$/.exec(body.target.trim());
-        if (!raw || !opts.knowsDevice?.(raw[1]!)) {
-          json(res, 422, {
-            error: `cannot resolve target "${body.target}" (${r.reason})`,
-            candidates: r.candidates.slice(0, 8),
-          });
-          return;
-        }
-        resolved = { device: raw[1]!, agent: raw[2]!, sessionId: raw[3]!, title: raw[3]!, cwd: '', lastActiveAt: 0 };
-      }
-      const to: SessionRef = { agent: resolved.agent, sessionId: resolved.sessionId };
-      if (resolved.device) to.device = resolved.device;
-      const from: SessionRef = isSessionRef(body.from) ? body.from : { agent: 'user', sessionId: 'cli' };
-      // remote targets are checked by the owning daemon at delivery time
-      const refused = !to.device && opts.preflight ? await opts.preflight(resolved) : null;
-      if (refused) {
-        json(res, 409, { error: refused, code: preflightCode(refused), resolvedTarget: resolved });
-        return;
-      }
-      let files: MessageFile[] = [];
-      if (Array.isArray(body.files) && body.files.length) {
-        if (!to.device || !opts.stageFiles) {
-          json(res, 400, { error: 'files can only be sent to another address over the Morse relay' });
-          return;
-        }
-        try {
-          files = opts.stageFiles(body.files.filter((f): f is string => typeof f === 'string'));
-        } catch (e) {
-          json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-          return;
-        }
-      }
-      const m = opts.mailbox.send({ from, to, text: body.text, via: 'cli', ...(files.length ? { files } : {}), ...(myAddress && to.device ? { myAddress, ...(myAgent ? { myAgent } : {}) } : {}) });
-      broadcast();
-      const chunks = files.length && opts.chunksFor ? opts.chunksFor(files, body.text) : 0;
-      // (ADR-081 review N1) `sentFrom`: the address of ours the message goes out from as the row records it — '' = none
-      // was named or remembered: this computer's first address. (Mail for a session here records none: the
-      // one that was named is echoed.) A daemon of the release before sends no such field.
-      json(res, 201, { message: m, resolvedTarget: resolved, sentFrom: to.device ? (m.myAddress ?? '') : (myAddress ?? ''), ...(chunks ? { chunks } : {}) });
-      return;
-    }
-    if (name === 'transfer') {
-      // ADR-038: how far an outgoing message (and its chunked files) is
-      const id = decodeURIComponent(param());
-      const m = opts.mailbox.getMessage(id);
-      if (!m) {
-        json(res, 404, { error: 'no such message' });
-        return;
-      }
-      json(res, 200, { message: m, transfer: opts.transferStatus?.(id) ?? null });
-      return;
-    }
-    if (name === 'update') {
-      // ADR-039: `morse update` asks before it installs (a transfer in progress defers it)
-      json(res, 200, opts.updateStatus?.() ?? { busy: null });
-      return;
-    }
-    if (name === 'messages') {
-      const body = (await readBody(req)) as Partial<SendBody> & { conversationId?: string };
-      if (!isSessionRef(body.from) || !isSessionRef(body.to) || typeof body.text !== 'string' || !body.text.trim()) {
-        json(res, 400, { error: 'expected {from:{agent,sessionId}, to:{agent,sessionId}, text, conversationId?}' });
-        return;
-      }
-      // (ADR-087 follow-up 4) the web console wires sessions on THIS computer together: a console session names no
-      // other device or address — mail to a contact is `morse send`'s, which the owner runs in a terminal
-      if (caller?.kind === 'console' && (body.to.device !== undefined || body.from.device !== undefined)) {
-        json(res, 403, { error: 'the web console sends between sessions here only — for another address use: morse send' });
-        return;
-      }
-      if (!body.to.device && opts.preflight) {
-        const to = body.to;
-        const target = (await opts.directory()).find(
-          (s) => !s.device && s.agent === to.agent && s.sessionId === to.sessionId,
-        );
-        const refused = target ? await opts.preflight(target) : null;
-        if (refused) {
-          json(res, 409, { error: refused, code: preflightCode(refused) });
-          return;
-        }
-      }
-      const m = opts.mailbox.send({
-        from: body.from,
-        to: body.to,
-        text: body.text,
-        via: 'webui',
-        ...(typeof body.conversationId === 'string' && body.conversationId
-          ? { conversationId: body.conversationId }
-          : {}),
-      });
-      broadcast();
-      // (ADR-081 review N1) like /api/send: the address of ours an outbound message goes out from ('' = the first)
-      json(res, 201, { message: m, ...(m.to.device ? { sentFrom: m.myAddress ?? '' } : {}) });
-      return;
-    }
-    if (name === 'accepted') {
-      const body = (await readBody(req)) as { handle?: unknown; deviceId?: unknown; myAddress?: unknown };
-      if (typeof body.handle !== 'string' || !body.handle.trim() || typeof body.deviceId !== 'string') {
-        json(res, 400, { error: 'expected {handle, deviceId}' });
-        return;
-      }
-      if (!opts.notifyAccepted) {
-        json(res, 404, { error: 'Morse relay is not enabled on this daemon' });
-        return;
-      }
-      let told: number;
-      try {
-        // (ADR-083) `myAddress`: which address of ours accepted ('' = the first) — a command of the release before sends none
-        told = await opts.notifyAccepted(body.handle, body.deviceId, typeof body.myAddress === 'string' ? body.myAddress : undefined);
-      } catch (e) {
-        json(res, 409, { error: e instanceof Error ? e.message : String(e) });
-        return;
-      }
-      broadcast();
-      json(res, 200, { ok: true, told });
-      return;
-    }
-    if (name === 'retry') {
-      req.resume();
-      const m = opts.mailbox.retry(param());
-      broadcast();
-      json(res, 200, { message: m });
-      return;
-    }
-    if (name === 'addressesReload') {
-      req.resume();
-      if (!opts.reloadAddresses) {
-        json(res, 404, { error: 'Morse relay is not enabled on this daemon' });
-        return;
-      }
-      json(res, 200, { ok: true, ...opts.reloadAddresses() });
-      return;
-    }
-    if (name === 'events') {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-store',
-        connection: 'keep-alive',
-      });
-      res.write(`data: {"kind":"hello"}\n\n`);
-      sseClients.add(res);
-      req.on('close', () => sseClients.delete(res));
-      return;
-    }
-    // (every name of LOCAL_API_ROUTES is handled above: this line is not reached)
-    name satisfies never;
-    json(res, 404, { error: 'not found' });
+    if (!answer) return; // the handler wrote the response itself (the page, the event stream)
+    // a POST whose handler never wanted a body: let whatever was sent drain
+    if (route.method === 'POST' && !bodyRead) req.resume();
+    sendJson(res, answer.status, answer.body);
+    if (after) setImmediate(after);
   }
 
-  server.on('error', (e: NodeJS.ErrnoException) => {
-    const hint = e.code === 'EADDRINUSE' ? ` — port ${port} already in use (another morse running?)` : '';
-    console.error(`console server error: ${e.message}${hint}`);
+  const server = createServer((req, res) => {
+    handle(req, res).catch((err: unknown) => {
+      req.resume();
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      const status = err instanceof HttpError ? err.status : 500;
+      sendJson(res, status, { error: err instanceof Error ? err.message : String(err) });
+    });
+  });
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    const busy = err.code === 'EADDRINUSE' ? ` — port ${port} already in use (another morse running?)` : '';
+    console.error(`console server error: ${err.message}${busy}`);
     process.exit(1);
   });
-  // loopback only, always: other devices reach us through the mutual-TLS peer server
+  // 127.0.0.1 and nothing else: other computers talk to the daemon through the mutual-TLS peer server
   server.listen(port, '127.0.0.1');
+
   return {
     port,
-    notifyChange: broadcast,
+    notifyChange: changed,
     close() {
-      clearInterval(pollTimer);
-      for (const c of sseClients) c.end();
+      clearInterval(poll);
+      streams.endAll();
       server.close();
     },
   };

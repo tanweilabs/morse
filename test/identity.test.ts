@@ -1,5 +1,5 @@
-import { X509Certificate } from 'node:crypto';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { createHash, createPrivateKey, X509Certificate } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -13,85 +13,159 @@ import {
   shortDeviceId,
 } from '../src/cluster/identity.js';
 
-const homes: string[] = [];
-const freshHome = () => {
-  const h = mkdtempSync(join(tmpdir(), 'anyd-identity-'));
-  homes.push(h);
-  return h;
+const scratch: string[] = [];
+const newHome = (): string => {
+  const dir = mkdtempSync(join(tmpdir(), 'morse-ident-'));
+  scratch.push(dir);
+  return dir;
 };
-afterAll(() => homes.forEach((h) => rmSync(h, { recursive: true, force: true })));
-
-describe('self-signed Ed25519 certificate (hand-rolled DER)', () => {
-  it('parses as X.509, is self-signed, and verifies with its own key', () => {
-    const { certPem } = createSelfSignedIdentity();
-    const cert = new X509Certificate(certPem);
-    expect(cert.subject).toContain('CN=anytoany');
-    expect(cert.issuer).toBe(cert.subject);
-    expect(cert.publicKey.asymmetricKeyType).toBe('ed25519');
-    expect(cert.verify(cert.publicKey)).toBe(true);
-    expect(new Date(cert.validTo).getUTCFullYear()).toBe(9999);
-    expect(new Date(cert.validFrom).getTime()).toBeLessThan(Date.now());
-  });
-
-  it('every identity is different (fresh key + random serial)', () => {
-    const a = createSelfSignedIdentity();
-    const b = createSelfSignedIdentity();
-    expect(a.certPem).not.toBe(b.certPem);
-    expect(a.keyPem).not.toBe(b.keyPem);
-  });
+afterAll(() => {
+  for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 });
 
-describe('canonical DER INTEGER (CI caught a 1-in-128 "illegal padding" on Node 20)', () => {
-  it('never emits a redundant leading zero, adds one only for a set high bit', () => {
-    expect(derInteger(Buffer.from([0x00, 0x05]))).toEqual(Buffer.from([0x02, 0x01, 0x05]));
-    expect(derInteger(Buffer.from([0x00, 0x00, 0x7f, 0x01]))).toEqual(Buffer.from([0x02, 0x02, 0x7f, 0x01]));
-    expect(derInteger(Buffer.from([0x80]))).toEqual(Buffer.from([0x02, 0x02, 0x00, 0x80]));
-    expect(derInteger(Buffer.from([0x00, 0x80]))).toEqual(Buffer.from([0x02, 0x02, 0x00, 0x80]));
-    expect(derInteger(Buffer.from([0x02]))).toEqual(Buffer.from([0x02, 0x01, 0x02]));
-    expect(derInteger(Buffer.from([0x00]))).toEqual(Buffer.from([0x02, 0x01, 0x00]));
+/** Split DER into its top-level elements: [tag, content] pairs. */
+function children(der: Buffer): Array<[number, Buffer]> {
+  const out: Array<[number, Buffer]> = [];
+  let at = 0;
+  while (at < der.length) {
+    const tag = der[at]!;
+    let len = der[at + 1]!;
+    let head = 2;
+    if (len & 0x80) {
+      const n = len & 0x7f;
+      len = der.subarray(at + 2, at + 2 + n).reduce((acc, b) => acc * 256 + b, 0);
+      head += n;
+    }
+    out.push([tag, der.subarray(at + head, at + head + len)]);
+    at += head + len;
+  }
+  return out;
+}
+
+describe('the certificate a new identity gets', () => {
+  const { certPem, keyPem } = createSelfSignedIdentity(new Date(Date.UTC(2026, 4, 20, 8, 30, 0)));
+  const cert = new X509Certificate(certPem);
+
+  it('is a self-signed Ed25519 X.509 certificate that verifies against its own key', () => {
+    expect(cert.publicKey.asymmetricKeyType).toBe('ed25519');
+    expect(cert.checkPrivateKey(createPrivateKey(keyPem))).toBe(true);
+    expect(cert.verify(cert.publicKey)).toBe(true);
+    expect(cert.subject).toBe('CN=anytoany');
+    expect(cert.issuer).toBe('CN=anytoany');
   });
 
-  it('serials are always canonical across many certificates', () => {
-    for (let i = 0; i < 400; i++) {
+  it('is valid from one day before it was made and never expires', () => {
+    expect(new Date(cert.validFrom).toISOString()).toBe('2026-05-19T08:30:00.000Z');
+    expect(cert.validTo).toMatch(/9999/);
+  });
+
+  it('has the fixed v3 layout: version, 16-byte serial, Ed25519, name, validity, name, key — no extensions', () => {
+    const [[outerTag, outer]] = children(cert.raw) as [[number, Buffer]];
+    expect(outerTag).toBe(0x30);
+    const [tbs, alg, sig] = children(outer);
+    expect(alg).toEqual([0x30, Buffer.from('06032b6570', 'hex')]);
+    expect(sig![0]).toBe(0x03);
+    expect(sig![1].length).toBe(65); // no unused bits + a 64-byte signature
+    expect(sig![1][0]).toBe(0);
+    const fields = children(tbs![1]);
+    expect(fields.map(([t]) => t)).toEqual([0xa0, 0x02, 0x30, 0x30, 0x30, 0x30, 0x30]);
+    expect(fields[0]![1]).toEqual(Buffer.from('020102', 'hex'));
+    expect(fields[1]![1].length).toBe(16);
+    expect(fields[3]![1]).toEqual(fields[5]![1]); // issuer = subject
+    expect(fields[3]![1].includes(Buffer.from([0x0c, 8, ...Buffer.from('anytoany')]))).toBe(true); // UTF8String
+    const [from, until] = children(fields[4]![1]);
+    expect(from).toEqual([0x17, Buffer.from('260519083000Z')]);
+    expect(until).toEqual([0x18, Buffer.from('99991231235959Z')]);
+  });
+
+  it('gets a fresh key and a fresh serial every time', () => {
+    const one = createSelfSignedIdentity();
+    const two = createSelfSignedIdentity();
+    expect(one.keyPem).not.toBe(two.keyPem);
+    expect(new X509Certificate(one.certPem).serialNumber).not.toBe(new X509Certificate(two.certPem).serialNumber);
+  });
+
+  it('always has a positive 16-byte serial with no padding byte (Node 20 rejects padded integers)', () => {
+    for (let i = 0; i < 300; i++) {
       const serial = new X509Certificate(createSelfSignedIdentity().certPem).serialNumber;
-      expect(serial).toMatch(/^[0-9A-F]{32}$/); // 16 bytes, positive, no padding byte
-      expect(serial.startsWith('00')).toBe(false);
+      expect(serial).toHaveLength(32);
+      expect(Number.parseInt(serial.slice(0, 2), 16)).toBeGreaterThanOrEqual(1);
+      expect(Number.parseInt(serial.slice(0, 2), 16)).toBeLessThan(0x80);
     }
   });
 });
 
-describe('device ID', () => {
-  it('is base32(sha256(cert DER)), 52 chars, grouped 7-by-7', () => {
-    const { certPem } = createSelfSignedIdentity();
-    const id = deviceIdFromCert(new X509Certificate(certPem).raw);
-    expect(id).toMatch(/^([A-Z2-7]{7}-){7}[A-Z2-7]{3}$/);
-    expect(shortDeviceId(id)).toBe(id.slice(0, 7));
+describe('derInteger', () => {
+  const hex = (...bytes: number[]) => derInteger(Buffer.from(bytes)).toString('hex');
+  it('drops superfluous leading zeros', () => {
+    expect(hex(0, 0, 0, 0x2a)).toBe('02012a');
+    expect(hex(0, 0x12, 0x34)).toBe('02021234');
+  });
+  it('keeps (or adds) exactly one zero in front of a set top bit', () => {
+    expect(hex(0xc0)).toBe('020200c0');
+    expect(hex(0, 0, 0xc0, 1)).toBe('020300c001');
+  });
+  it('encodes zero as a single zero byte', () => {
+    expect(hex(0, 0, 0)).toBe('020100');
+    expect(hex(0)).toBe('020100');
+  });
+  it('leaves an already canonical value alone', () => {
+    expect(hex(0x7f, 0xff)).toBe('02027fff');
+  });
+});
+
+describe('device IDs', () => {
+  it('are the base32 SHA-256 of the certificate DER, 52 characters in groups of seven', () => {
+    const der = Buffer.from('any bytes stand in for a certificate here');
+    const id = deviceIdFromCert(der);
+    expect(id).toMatch(/^(?:[A-Z2-7]{7}-){7}[A-Z2-7]{3}$/);
+    // the last character holds one bit of the digest: the top bit of its 5, so it is A or Q
+    const lastBit = createHash('sha256').update(der).digest()[31]! & 1;
+    expect(id.at(-1)).toBe(lastBit ? 'Q' : 'A');
   });
 
-  it('normalizes what a human pastes (case, spaces, dashes) and rejects junk', () => {
-    const { certPem } = createSelfSignedIdentity();
-    const id = deviceIdFromCert(new X509Certificate(certPem).raw);
-    const messy = ` ${id.toLowerCase().replace(/-/g, ' ')} `;
-    expect(normalizeDeviceId(messy)).toBe(id);
-    expect(formatDeviceId(id.replace(/-/g, ''))).toBe(id);
-    expect(normalizeDeviceId('ABC')).toBeNull();
-    expect(normalizeDeviceId(`${id.replace(/-/g, '').slice(0, 51)}1`)).toBeNull(); // '1' is not base32
+  it('match a known value', () => {
+    expect(deviceIdFromCert(Buffer.from('hello'))).toBe('FTZE3OS-7WCRQ4J-XIHMVML-OPCTYNR-MHS4D6T-UEXTTAQ-ZWFE4LT-ASA');
+  });
+
+  it('read back from what people paste', () => {
+    const id = deviceIdFromCert(Buffer.from('x'));
+    expect(normalizeDeviceId(id)).toBe(id);
+    expect(normalizeDeviceId(`\t${id.toLowerCase().replace(/-/g, '  ')}\n`)).toBe(id);
+    expect(normalizeDeviceId(id.replace(/-/g, ''))).toBe(id);
+    expect(normalizeDeviceId(`${id}A`)).toBeNull(); // too long
+    expect(normalizeDeviceId(id.slice(0, -1))).toBeNull(); // too short
+    expect(normalizeDeviceId(id.replace(/^./, '0'))).toBeNull(); // 0 is not in the alphabet
+    expect(normalizeDeviceId('')).toBeNull();
+  });
+
+  it('format and shorten', () => {
+    expect(formatDeviceId('ABCDEFGHIJKLMNOPQRSTUVWXYZ')).toBe('ABCDEFG-HIJKLMN-OPQRSTU-VWXYZ');
+    expect(formatDeviceId('')).toBe('');
+    expect(shortDeviceId('QWERTYU-ASDFGHJ-ZXC')).toBe('QWERTYU');
   });
 });
 
 describe('loadOrCreateIdentity', () => {
-  it('creates once, is stable across loads, and locks the private key down', () => {
-    const home = freshHome();
-    const a = loadOrCreateIdentity(home);
-    const b = loadOrCreateIdentity(home);
-    expect(b.id).toBe(a.id);
-    expect(b.certPem).toBe(a.certPem);
+  it('writes key.pem and cert.pem under <home>/.morse/identity with private modes, then keeps returning them', () => {
+    const home = newHome();
+    const first = loadOrCreateIdentity(home);
     const dir = join(home, '.morse', 'identity');
-    expect(statSync(dir).mode & 0o777).toBe(0o700);
-    expect(statSync(join(dir, 'key.pem')).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(dir, 'key.pem'), 'utf8')).toBe(first.keyPem);
+    expect(readFileSync(join(dir, 'cert.pem'), 'utf8')).toBe(first.certPem);
+    if (process.platform !== 'win32') {
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(statSync(join(dir, 'key.pem')).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dir, 'cert.pem')).mode & 0o777).toBe(0o644);
+    }
+    expect(first.id).toBe(deviceIdFromCert(new X509Certificate(first.certPem).raw));
+    expect(loadOrCreateIdentity(home)).toEqual(first);
   });
 
-  it('two homes get two different devices', () => {
-    expect(loadOrCreateIdentity(freshHome()).id).not.toBe(loadOrCreateIdentity(freshHome()).id);
+  it('gives each home its own device', () => {
+    const a = newHome();
+    const b = newHome();
+    expect(loadOrCreateIdentity(a).id).not.toBe(loadOrCreateIdentity(b).id);
+    expect(existsSync(join(a, '.morse', 'identity', 'cert.pem'))).toBe(true);
   });
 });

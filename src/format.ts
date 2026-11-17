@@ -1,19 +1,24 @@
 import { homedir } from 'node:os';
 
-/** '2m ago', '3h ago', '5d ago' — coarse relative time for directory listings. */
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * How long ago, coarsely, for listings: 'just now' under a minute, then whole minutes, hours or days
+ * ('2m ago', '3h ago', '5d ago'). A time in the future counts as now.
+ */
 export function formatRelativeTime(epochMs: number, nowMs: number = Date.now()): string {
-  const diff = Math.max(0, nowMs - epochMs);
-  const min = Math.floor(diff / 60_000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${min}m ago`;
-  const hours = Math.floor(min / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
+  const elapsed = Math.max(0, nowMs - epochMs);
+  if (elapsed < MINUTE_MS) return 'just now';
+  const [size, suffix] = elapsed < HOUR_MS ? [MINUTE_MS, 'm'] : elapsed < DAY_MS ? [HOUR_MS, 'h'] : [DAY_MS, 'd'];
+  return `${Math.floor(elapsed / size)}${suffix} ago`;
 }
 
-/** Abbreviate the user's home directory to '~' for display. */
+/** A path under the home directory as `~/…`, for display; any other path as it is. */
 export function shortenHome(path: string, home: string = homedir()): string {
-  return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+  if (!path.startsWith(home)) return path;
+  return '~' + path.slice(home.length);
 }
 
 /** '45s', '12m', '3h 05m', '8d 10h' — a coarse duration. */

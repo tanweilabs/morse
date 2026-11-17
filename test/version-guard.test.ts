@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import type { ExecFn } from '../src/adapters/types.js';
 import {
   VERSION_MISMATCH,
   checkCliVersion,
@@ -7,127 +6,150 @@ import {
   inferWriterVersion,
   isCliOlder,
   parseVersion,
+  type WriterSample,
 } from '../src/adapters/version-guard.js';
+import { recordingExec } from './helpers/fake-exec.js';
 
-describe('parseVersion', () => {
-  it('reads the numeric core from real CLI / session strings', () => {
-    expect(parseVersion('2.1.296 (Claude Code)')).toEqual([2, 1, 296]);
-    expect(parseVersion('codex-cli 0.157.1')).toEqual([0, 157, 1]);
-    expect(parseVersion('0.162.0-alpha.17.2')).toEqual([0, 162, 0]);
+describe('parseVersion: the first major.minor.patch in a string', () => {
+  it.each([
+    ['2.1.300 (Claude Code)', [2, 1, 300]],
+    ['codex-cli 0.170.2', [0, 170, 2]],
+    ['0.165.0-alpha.3+build.9', [0, 165, 0]],
+    ['v10.20.30 and later 1.2.3', [10, 20, 30]],
+    ['1.2.3.4', [1, 2, 3]],
+  ])('%s', (raw, core) => {
+    expect(parseVersion(raw)).toEqual(core);
   });
 
-  it('returns null for anything without x.y.z', () => {
-    expect(parseVersion('')).toBeNull();
-    expect(parseVersion('BRAVO')).toBeNull();
-    expect(parseVersion('v2.1')).toBeNull();
-  });
-});
-
-describe('isCliOlder', () => {
-  it('flags a CLI older than the session writer', () => {
-    expect(isCliOlder('2.1.287', '2.1.295')).toBe(true);
-    expect(isCliOlder('codex-cli 0.157.1', '0.162.0-alpha.17.2')).toBe(true);
-    expect(isCliOlder('1.9.9', '2.0.0')).toBe(true);
-  });
-
-  it('lets a newer or equal CLI through — only the old→new direction breaks', () => {
-    expect(isCliOlder('2.1.296', '2.1.295')).toBe(false);
-    expect(isCliOlder('2.1.295', '2.1.295')).toBe(false);
-    // prerelease suffix is ignored: npm `latest` 0.162.1 can resume a 0.162.0-alpha session
-    expect(isCliOlder('0.162.1', '0.162.0-alpha.17.2')).toBe(false);
-    expect(isCliOlder('0.162.0', '0.162.0-alpha.17.2')).toBe(false);
-  });
-
-  it('never blocks on an unparseable side', () => {
-    expect(isCliOlder('garbage', '2.1.295')).toBe(false);
-    expect(isCliOlder('2.1.287', '')).toBe(false);
+  it.each(['', 'unknown', '3.1', 'v.1.2', '1..2.3'])('nothing usable in %j', (raw) => {
+    expect(parseVersion(raw)).toBeNull();
   });
 });
 
-function countingExec(stdout: string, code = 0) {
-  const calls: string[][] = [];
-  const exec: ExecFn = async (cmd, args) => {
-    calls.push([cmd, ...args]);
-    return { stdout, stderr: '', code };
-  };
-  return { exec, calls };
-}
-
-describe('createVersionProbe', () => {
-  it('runs `<cmd> --version` and caches the result within the TTL', async () => {
-    const { exec, calls } = countingExec('2.1.296 (Claude Code)\n');
-    let t = 0;
-    const probe = createVersionProbe(exec, 'claude', { ttlMs: 60_000, now: () => t });
-    expect(await probe()).toBe('2.1.296 (Claude Code)');
-    t = 59_999;
-    await probe();
-    expect(calls).toEqual([['claude', '--version']]);
-  });
-
-  it('re-probes after the TTL so an upgrade takes effect without a daemon restart', async () => {
-    const { exec, calls } = countingExec('2.1.296');
-    let t = 0;
-    const probe = createVersionProbe(exec, 'claude', { ttlMs: 60_000, now: () => t });
-    await probe();
-    t = 60_001;
-    await probe();
-    expect(calls).toHaveLength(2);
-  });
-
-  it('returns null when the CLI is missing or errors', async () => {
-    const { exec } = countingExec('', 127);
-    const probe = createVersionProbe(exec, 'codex', { now: () => 0 });
-    expect(await probe()).toBeNull();
+describe('isCliOlder: only a CLI strictly behind the writer is refused', () => {
+  it.each([
+    ['2.1.287', '2.1.295', true],
+    ['1.99.99', '2.0.0', true],
+    ['0.9.0', '0.10.0', true],
+    ['codex-cli 0.157.1', '0.162.0-alpha.17.2', true],
+    ['2.1.295', '2.1.295', false],
+    ['2.2.0', '2.1.999', false],
+    ['0.162.0', '0.162.0-alpha.17.2', false],
+    ['0.162.0-alpha.1', '0.162.0', false],
+    ['not a version', '9.9.9', false],
+    ['1.0.0', 'unknown', false],
+  ])('cli %s vs writer %s → %s', (cli, writer, older) => {
+    expect(isCliOlder(cli, writer)).toBe(older);
   });
 });
 
-describe('checkCliVersion', () => {
-  const spec = { cli: 'codex', app: 'Codex Desktop', upgrade: 'npm i -g @openai/codex@latest' };
-
-  it('returns an actionable version_mismatch error when the CLI is older', async () => {
-    const err = await checkCliVersion(async () => 'codex-cli 0.157.1', spec, '0.162.0-alpha.17.2');
-    expect(err).not.toBeNull();
-    expect(err!.startsWith(VERSION_MISMATCH)).toBe(true);
-    expect(err).toContain('0.157.1');
-    expect(err).toContain('0.162.0-alpha.17.2');
-    expect(err).toContain('npm i -g @openai/codex@latest');
+describe('createVersionProbe: `<cli> --version`, remembered for a while', () => {
+  it('asks once per TTL, trims the answer, and asks again when it has aged out', async () => {
+    const { exec, argvs, runs } = recordingExec({ stdout: '  0.170.2\n' });
+    let clock = 1_000;
+    const probe = createVersionProbe(exec, 'codex', { ttlMs: 500, now: () => clock });
+    expect(await probe()).toBe('0.170.2');
+    clock = 1_500;
+    expect(await probe()).toBe('0.170.2');
+    expect(argvs()).toEqual([['codex', '--version']]);
+    expect(runs[0]?.opts).toEqual({ timeoutMs: 10_000 });
+    clock = 1_501;
+    await probe();
+    expect(argvs()).toHaveLength(2);
   });
 
-  it('passes when versions are compatible', async () => {
-    expect(await checkCliVersion(async () => 'codex-cli 0.162.1', spec, '0.162.0-alpha.17.2')).toBeNull();
+  it('defaults to a one-minute TTL', async () => {
+    const { exec, argvs } = recordingExec({ stdout: '1.0.0' });
+    let clock = 0;
+    const probe = createVersionProbe(exec, 'claude', { now: () => clock });
+    await probe();
+    clock = 60_000;
+    await probe();
+    expect(argvs()).toHaveLength(1);
+    clock = 60_001;
+    await probe();
+    expect(argvs()).toHaveLength(2);
   });
 
-  it('skips the probe entirely when the session has no recorded writer version', async () => {
-    let probed = false;
-    const probe = async () => {
-      probed = true;
-      return '0.1.0';
+  it('a failing, silent or throwing CLI yields null — and that answer is remembered too', async () => {
+    const failing = recordingExec({ code: 127, stdout: '1.0.0' });
+    const p1 = createVersionProbe(failing.exec, 'kimi', { now: () => 0 });
+    expect(await p1()).toBeNull();
+    await p1();
+    expect(failing.argvs()).toHaveLength(1);
+
+    const silent = recordingExec({ stdout: ' \n' });
+    expect(await createVersionProbe(silent.exec, 'kimi', { now: () => 0 })()).toBeNull();
+
+    const throwing = createVersionProbe(async () => {
+      throw new Error('spawn EACCES');
+    }, 'kimi', { now: () => 0 });
+    expect(await throwing()).toBeNull();
+  });
+});
+
+describe('checkCliVersion: the refusal, or null', () => {
+  const spec = { cli: 'claude', app: 'Claude Code (desktop App)', upgrade: 'npm i -g @anthropic-ai/claude-code@latest' };
+
+  it('an older CLI gets the full, actionable explanation', async () => {
+    const message = await checkCliVersion(async () => '2.1.287 (Claude Code)', spec, '2.1.295');
+    expect(message).toBe(
+      'version_mismatch: the claude CLI Morse delivers with (2.1.287 (Claude Code)) is older than the ' +
+        'Claude Code (desktop App) that last wrote this session (2.1.295). Resuming it with the older CLI fails ' +
+        '(often a bare "exit 1"), so the message was NOT sent. Ask the operator to upgrade: ' +
+        'npm i -g @anthropic-ai/claude-code@latest — then resend (a dead-lettered one can be retried from the ' +
+        'web console: morse console). See ADR-025.',
+    );
+    expect(message?.startsWith(VERSION_MISMATCH)).toBe(true);
+  });
+
+  it('passes a CLI that is as new or newer, or whose version is unknown', async () => {
+    expect(await checkCliVersion(async () => '2.1.295', spec, '2.1.295')).toBeNull();
+    expect(await checkCliVersion(async () => '2.2.0', spec, '2.1.295')).toBeNull();
+    expect(await checkCliVersion(async () => null, spec, '2.1.295')).toBeNull();
+  });
+
+  it('does not even probe when the session records no writer', async () => {
+    let asked = 0;
+    const countingProbe = async () => {
+      asked++;
+      return '0.0.1';
     };
-    expect(await checkCliVersion(probe, spec, undefined)).toBeNull();
-    expect(probed).toBe(false);
-  });
-
-  it('passes when the CLI version cannot be determined', async () => {
-    expect(await checkCliVersion(async () => null, spec, '0.162.0')).toBeNull();
+    expect(await checkCliVersion(countingProbe, spec, undefined)).toBeNull();
+    expect(await checkCliVersion(countingProbe, spec, '')).toBeNull();
+    expect(asked).toBe(0);
   });
 });
 
-describe('inferWriterVersion', () => {
-  const samples = [
-    { originator: 'Codex Desktop', version: '0.162.0-alpha.17.2', at: 100 },
-    { originator: 'Codex Desktop', version: '0.150.0', at: 50 },
-    { originator: 'codex-tui', version: '0.170.0', at: 10 },
+describe('inferWriterVersion: who most plausibly wrote a session last', () => {
+  const seen: WriterSample[] = [
+    { originator: 'Codex Desktop', version: '0.150.0', at: 1_000 },
+    { originator: 'Codex Desktop', version: '0.170.0-alpha.2', at: 3_000 },
+    { originator: 'Codex Desktop', version: '0.160.0', at: 2_000 },
+    { originator: 'Codex Desktop', version: 'garbled', at: 2_500 },
+    { originator: 'codex_exec', version: '0.199.0', at: 500 },
   ];
-  it('takes the highest same-originator version seen up to lastActiveAt', () => {
-    expect(inferWriterVersion('0.144.2', 'Codex Desktop', 100, samples)).toBe('0.162.0-alpha.17.2');
-    expect(inferWriterVersion('0.144.2', 'Codex Desktop', 99, samples)).toBe('0.150.0');
+
+  it('the highest version its originator ran up to the session\'s last activity', () => {
+    expect(inferWriterVersion('0.140.0', 'Codex Desktop', 3_000, seen)).toBe('0.170.0-alpha.2');
+    expect(inferWriterVersion('0.140.0', 'Codex Desktop', 2_999, seen)).toBe('0.160.0');
+    expect(inferWriterVersion('0.140.0', 'Codex Desktop', 1_000, seen)).toBe('0.150.0');
   });
-  it('never goes below the session\'s own record, and ignores other originators', () => {
-    expect(inferWriterVersion('0.165.0', 'Codex Desktop', 100, samples)).toBe('0.165.0');
-    expect(inferWriterVersion('0.144.2', 'Codex Desktop', 20, samples)).toBe('0.144.2');
+
+  it('never below its own record; nothing applicable keeps the own record', () => {
+    expect(inferWriterVersion('0.165.0', 'Codex Desktop', 2_999, seen)).toBe('0.165.0');
+    expect(inferWriterVersion('0.140.0', 'Codex Desktop', 999, seen)).toBe('0.140.0');
+    expect(inferWriterVersion('0.140.0', 'codex-tui', 10_000, seen)).toBe('0.140.0');
   });
-  it('without an originator, keeps the own record', () => {
-    expect(inferWriterVersion('0.144.2', undefined, 1e15, samples)).toBe('0.144.2');
-    expect(inferWriterVersion(undefined, undefined, 1e15, samples)).toBeUndefined();
+
+  it('without an own record the originator\'s sightings still count; without an originator only the own record does', () => {
+    expect(inferWriterVersion(undefined, 'Codex Desktop', 2_000, seen)).toBe('0.160.0');
+    expect(inferWriterVersion(undefined, 'Codex Desktop', 10, seen)).toBeUndefined();
+    expect(inferWriterVersion('0.100.0', undefined, 10_000, seen)).toBe('0.100.0');
+    expect(inferWriterVersion(undefined, undefined, 10_000, seen)).toBeUndefined();
+  });
+
+  it('an unparseable own record is replaced by any parseable sighting', () => {
+    expect(inferWriterVersion('dev-build', 'Codex Desktop', 1_000, seen)).toBe('0.150.0');
   });
 });

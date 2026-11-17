@@ -4,129 +4,122 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { liveClaudeInboxes } from './claude-inbox.js';
 
-/**
- * Detect Claude sessions that are currently open in an INTERACTIVE process, so the
- * dispatcher does not headless-`claude -p --resume` into them (ADR-023).
- *
- * Why this matters (verified 2026-09-05 with real mailbox + transcript evidence):
- * resume-delivering into a live Claude session makes the injected turn physically
- * land in the transcript, yet `claude -p` still exits non-zero — a post-turn hook
- * chokes on a huge transcript ("Hook cancelled"), or the exit is simply 1 with an
- * empty stderr when a second process shares the session. Either way Morse
- * false-failed and retried 3×, re-injecting duplicate turns into the session the
- * operator was actively using, before dead-lettering a message that had already
- * arrived. Live sessions are surfaced instead by their own pull hook / `anyd
- * monitor`, so the right move is to leave the message pending — exactly what we
- * already do for a monitored session (see monitor.ts).
- *
- * The interactive form is `--resume=<uuid>` (an `=`); our own headless delivery is
- * `--resume <uuid>` (a space), so matching the `=` form never matches a delivery.
- */
+// Which local sessions are open right now, so the dispatcher leaves them alone.
+//
+// Claude (ADR-023). Resuming a Claude session with `claude -p --resume` while a
+// person has it open does land the turn in the transcript, but the process still
+// exits non-zero (a post-turn hook gives up on the large transcript, or a bare
+// exit 1 when two processes share the session). Seen 2026-09-05: Morse took that
+// for a failure, retried three times — three duplicate turns in the session the
+// operator was using — then dead-lettered a message that had arrived. An open
+// session gets its mail through its own hook / `morse monitor`, so the message
+// simply stays pending, as for a monitored session (monitor.ts).
+//
+// Open sessions show up in `ps` as `--resume=<uuid>`. Morse's own deliveries
+// pass `--resume <uuid>` with a space, so they never match.
 
-const UUID = /--resume=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/g;
+const UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 
-/** Pure: extract interactively-open Claude session ids from `ps` command output. */
+/** How long one probe result is reused, so the dispatcher can ask on every message. */
+const REUSE_MS = 2_000;
+
+/** Session ids of interactively open Claude processes, read from `ps -o command` output. */
 export function parseLiveClaudeSessions(psOutput: string): Set<string> {
-  const ids = new Set<string>();
-  for (const match of psOutput.matchAll(UUID)) {
-    if (match[1]) ids.add(match[1]);
-  }
-  return ids;
+  const pattern = new RegExp(`--resume=(${UUID_SOURCE})`, 'g');
+  return new Set(Array.from(psOutput.matchAll(pattern), (m) => m[1] as string));
 }
 
-const TTL_MS = 2_000;
-let cache: { at: number; ids: Set<string> } | null = null;
+/** Wrap `probe` so its answer is reused for `ttlMs` after each fresh call. */
+function reused(probe: () => Set<string>, ttlMs: number): (now: () => number) => Set<string> {
+  let value: Set<string> | undefined;
+  let takenAt = 0;
+  return (now) => {
+    const at = now();
+    if (value === undefined || at - takenAt >= ttlMs) {
+      value = probe();
+      takenAt = at;
+    }
+    return value;
+  };
+}
 
-/**
- * Session ids currently open in an interactive Claude process. Cached briefly so
- * the dispatch hot path can call it cheaply and synchronously. Best-effort: any
- * failure (no `ps`, not permitted, non-macOS/Linux) yields an empty set, so
- * delivery falls back to the normal resume path rather than blocking.
- */
-export function liveClaudeSessions(now: () => number = Date.now): Set<string> {
-  const t = now();
-  if (cache && t - cache.at < TTL_MS) return cache.ids;
-  let ids = new Set<string>();
+/** Asks `ps`; when it is missing, refused or slow, nothing counts as open and delivery goes ahead as usual. */
+function claudeProcessesNow(): Set<string> {
   try {
-    const out = execFileSync('ps', ['-axww', '-o', 'command'], { encoding: 'utf8', timeout: 4_000 });
-    ids = parseLiveClaudeSessions(out);
+    return parseLiveClaudeSessions(execFileSync('ps', ['-axww', '-o', 'command'], { encoding: 'utf8', timeout: 4_000 }));
   } catch {
-    // no `ps` / not permitted — treat as "nothing known live"
+    return new Set();
   }
-  cache = { at: t, ids };
-  return ids;
 }
 
-/*
- * Codex twin (ADR-026). A Codex thread open in Codex Desktop refuses a headless
- * `codex exec resume` outright: "thread-store conflict: thread <id> already has an
- * active writer" — the turn never runs, so the 3 retries were pure noise before the
- * message dead-lettered. Upstream (codex-rs/rollout/src/writer_lock.rs) every writer
- * flock()s `<CODEX_HOME>/thread-writer-locks/<thread_id>.lock` and deletes the file
- * when it lets go; a crashed writer can leave an orphan file behind. So a thread is
- * live when its lock file exists AND some process holds it open — asked of `lsof`,
- * which is read-only. We never try the flock ourselves: holding it even for an
- * instant could make the user's own Codex Desktop fail to open that thread.
- */
+const claudeProbe = reused(claudeProcessesNow, REUSE_MS);
 
-const THREAD_LOCK = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.lock$/;
+/** Claude session ids open in an interactive process right now (briefly cached, synchronous, best-effort). */
+export function liveClaudeSessions(now: () => number = Date.now): Set<string> {
+  return claudeProbe(now);
+}
 
-/** Pure: thread ids whose writer lock appears as an open file in `lsof -F n` output. */
+// Codex (ADR-026). A thread that Codex Desktop has open rejects `codex exec resume`
+// with "thread-store conflict: thread <id> already has an active writer". Per
+// codex-rs/rollout/src/writer_lock.rs a writer flock()s
+// <CODEX_HOME>/thread-writer-locks/<thread id>.lock and removes the file when
+// done; a writer that crashed can leave the file without holding it. So a thread
+// counts as open when its lock file exists and `lsof` (read-only) shows some
+// process holding it. We never take the flock ourselves — even briefly, that
+// could stop the user's Codex Desktop from opening the thread.
+
+const LOCK_FILE = new RegExp(`(${UUID_SOURCE})\\.lock$`);
+
+/** Thread ids whose lock file appears as an open file (`n…` lines) in `lsof -F n` output. */
 export function parseCodexLockHolders(lsofOutput: string): Set<string> {
-  const ids = new Set<string>();
+  const held = new Set<string>();
   for (const line of lsofOutput.split('\n')) {
-    if (!line.startsWith('n')) continue;
-    const match = THREAD_LOCK.exec(line);
-    if (match?.[1]) ids.add(match[1]);
+    const id = line.startsWith('n') ? LOCK_FILE.exec(line)?.[1] : undefined;
+    if (id) held.add(id);
   }
-  return ids;
+  return held;
 }
 
 export interface CodexLivenessOptions {
-  /** `<CODEX_HOME>/thread-writer-locks` */
+  /** Folder of writer lock files; default ~/.codex/thread-writer-locks. */
   lockDir?: string;
-  /** Returns `lsof -F n` output for the given lock files. */
+  /** Who holds these lock files, as `lsof -F n` would print it. */
   holders?: (paths: string[]) => string;
   ttlMs?: number;
 }
 
-const lsofHolders = (paths: string[]): string =>
-  // exits 1 when none of the files is open — that's an answer, not an error
-  spawnSync('lsof', ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: 4_000 }).stdout ?? '';
-
-/** Build a cached probe for Codex threads that currently have a live writer. */
-export function createCodexLiveness(options: CodexLivenessOptions = {}): (now?: () => number) => Set<string> {
-  const lockDir = options.lockDir ?? join(homedir(), '.codex', 'thread-writer-locks');
-  const holders = options.holders ?? lsofHolders;
-  const ttlMs = options.ttlMs ?? TTL_MS;
-  let cached: { at: number; ids: Set<string> } | null = null;
-  return (now = Date.now) => {
-    const t = now();
-    if (cached && t - cached.at < ttlMs) return cached.ids;
-    let ids = new Set<string>();
-    try {
-      const locks = readdirSync(lockDir)
-        .filter((name) => THREAD_LOCK.test(name))
-        .map((name) => join(lockDir, name));
-      // the common case — no Codex thread open — costs a readdir, not a spawn
-      if (locks.length > 0) ids = parseCodexLockHolders(holders(locks));
-    } catch {
-      // no Codex home / no lsof / not permitted — treat as "nothing known live"
-    }
-    cached = { at: t, ids };
-    return ids;
-  };
+/** `lsof -F n` for these files. Exit status 1 just means none is open, so only stdout matters. */
+function runLsof(paths: string[]): string {
+  return spawnSync('lsof', ['-F', 'n', '--', ...paths], { encoding: 'utf8', timeout: 4_000 }).stdout ?? '';
 }
 
-/** Codex thread ids currently held by a writer (typically Codex Desktop's app-server). */
+/** A cached probe for the Codex threads that have a live writer right now. */
+export function createCodexLiveness(options: CodexLivenessOptions = {}): (now?: () => number) => Set<string> {
+  const lockDir = options.lockDir ?? join(homedir(), '.codex', 'thread-writer-locks');
+  const lsof = options.holders ?? runLsof;
+  const probe = (): Set<string> => {
+    try {
+      const locks = readdirSync(lockDir).flatMap((name) => (LOCK_FILE.test(name) ? [join(lockDir, name)] : []));
+      // usually no thread is open: then a directory listing is all it costs
+      return locks.length === 0 ? new Set() : parseCodexLockHolders(lsof(locks));
+    } catch {
+      // no Codex home, no lsof, or not permitted: nothing counts as open
+      return new Set();
+    }
+  };
+  const cached = reused(probe, options.ttlMs ?? REUSE_MS);
+  return (now = Date.now) => cached(now);
+}
+
+/** Codex thread ids held by a writer right now (usually Codex Desktop's app-server). */
 export const liveCodexThreads = createCodexLiveness();
 
 /**
- * Is this local session being run by a live process that surfaces its own mail, so
- * the dispatcher must NOT headless-resume into it? Claude only: the inbox registry
- * (ADR-027 — the only signal that sees desktop-App sessions, whose command line has
- * no `--resume=`) plus the `ps` scan (ADR-023). Live Codex threads are NOT skipped
- * any more: the codex adapter queues into Codex Desktop instead (ADR-027).
+ * Must the dispatcher stay out of this local session because a running process
+ * picks up its mail itself? Claude only: a session with a live inbox (ADR-027 —
+ * the one signal that sees desktop-App sessions, which have no `--resume=` on
+ * their command line) or one found by the `ps` scan (ADR-023). Open Codex threads
+ * are not skipped: the codex adapter queues into Codex Desktop instead (ADR-027).
  */
 export function isSessionLive(sessionId: string, now: () => number = Date.now): boolean {
   return liveClaudeInboxes().has(sessionId) || liveClaudeSessions(now).has(sessionId);

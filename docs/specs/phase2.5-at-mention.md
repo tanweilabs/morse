@@ -1,35 +1,24 @@
-# Phase 2.5 规格 — @any 寻址层（用户确认式补全）
+# 在 Claude Code 里用 `@` 点名别的会话
 
-> 创建：2026-08-05 · 最后更新：2026-11-14
-> **名字说明（2026-11-14）**：文中的 `anyd`、`any-` 前缀是当时的名字，属于历史写法，正文不改；命令行现在叫 `morse`（ADR-033），生成的 agent 文件用 `morse-` 前缀（`src/cluster/sync-agents.ts`）。
-> 状态：已实施（2026-08-05）。增补：候选集过滤临时目录会话（/tmp、/private/tmp、/var/folders——冒烟残留不入补全列表）。动机：用户提出（见 ADR 系列实战反馈）——agent 自由模糊寻址有误投风险，应由用户在补全里亲手确认目标；且 Claude Code 输入框的 `@` 补全被文件引用占用，需要能「占位」的机制。
+> 创建：2026-08-05 · 最后更新：2026-11-17（按现状重写）
+> 代码：`src/cluster/sync-agents.ts`
 
-## 0. 核心洞察（用户方案 + 机制验证）
+## 想解决什么
 
-Claude Code 的 `@` 补全会列出 `~/.claude/agents/` 下的全部 agent。因此：**把每个可寻址的目标会话物化成一个 `any-` 前缀的 agent 定义文件**，用户打 `@any` 时补全列表全是我们的条目，越输越精确——已手工验证（any-codex-ios 热加载成功、出现在补全与 agent 列表）。
+让 agent 自己按名字猜目标会话，有投错的风险；Claude Code 输入框的 `@` 又被文件引用占着。办法是借 Claude Code 自己的机制：`~/.claude/agents/` 里的每个 agent 定义都会出现在 `@` 补全里。所以把每个值得点名的会话写成一个 agent 文件，用户在补全列表里亲手选中，就等于确认了目标。
 
-选中即确认：每个 agent 文件**生成时预绑定精确 session id**，被 @ 到的投递代理零模糊匹配、零自由发挥——从机制上排除误投。
+## 做法
 
-## 1. 自动同步（daemon 职责）
+daemon 每次刷新会话目录后同步一遍 `~/.claude/agents/`：
 
-daemon 每次目录刷新后执行 `syncMentionAgents`：
+- **挑哪些会话**：除 Claude 以外各家的本机会话，按最近活跃每家最多 8 个；已经有过对话的对端不受名额限制。临时目录里的会话（`/tmp`、`/private/tmp`、`/var/folders`，或没有目录）不收。Claude 会话不写，太多，而且 Claude 之间有自己的发信方式。
+- **起名**：`morse-` 前缀加 agent 名和目录名（或标题）的 ASCII 短名；重名时加会话 id 前 4 位。
+- **文件内容**：说明里写会话标题、目录和活跃时间；正文是一个只做转发的小代理（`model: haiku`，只给 Bash），目标会话 id 在生成时写死，它原样转发、失败就照实报告，不做别的。
+- **只动自己的文件**：只有文件名带我们的前缀、而且确实是我们生成的，才会被改写或删除；内容没变不写盘；会话消失，对应文件删掉。用户自己的 agent 文件永远不碰。
+- **隔离环境不同步**：用临时 `MORSE_HOME` 跑的 daemon（测试、冒烟）不写真实的 `~/.claude/agents/`。
 
-- **候选集**：非 claude 的本机+远端活跃会话（codex/kimi/gemini…），按 lastActiveAt 取 TOP 8/agent 类型；加上已连接对话（conversations）的全部对端（不论排名）。claude↔claude 暂不物化（客户端有原生 send_message；避免 4000+ 会话污染补全）。
-- **命名**：`any-[<device>-]<agent>-<cwd 目录名或标题的 ascii 化>`，冲突追加 id 前 4 位；全小写 kebab。例：`any-codex-mobile-app-ios`、`any-mini-codex-frontend`。
-- **文件内容**：frontmatter（name、description 含标题/目录/活跃时间、tools: Bash、model: haiku——投递代理用最便宜模型）+ 投递代理 prompt（精确 target、自我定位发起方、verbatim 转发、失败如实报告、不做任何其他事）。
-- **卫生纪律**：只创建/更新/删除 `any-` 前缀文件；内容不变不写盘；消失的会话对应文件删除；绝不触碰用户自己的 agents。
+## 和自然语言发信的关系
 
-## 2. 安全模型（回应误投批评）
+agent 也可以直接 `morse send`。发给从没联系过的新目标时，skill 要求先把解析出的会话（标题、id、目录）给用户确认再发；`@` 点名的路径本身就是确认过的。
 
-- @any-xxx 路径：目标预绑定，用户选中即确认——主推路径；
-- 自然语言路径（skill anyd send）保留但收紧：**未建立过对话的新目标，agent 必须先向用户展示解析结果（标题+id+目录）确认后再发**；已连接对话直接发（skill 同步该规则）。
-
-## 3. Codex 侧对应（待办）
-
-Codex 自定义 agent 为 TOML 定义，`@` 提及支持度与热加载行为待实测；先行方案：Codex 会话内自然语言触发（skill 已通）。实测通过后在 `~/.codex/` 对应目录物化 `any-claude-*` 系列。
-
-## 4. 验收
-
-1. daemon 运行中，`~/.claude/agents/` 出现 `any-codex-*` 系列且随会话活跃度自动增删；
-2. Claude Code 输入框打 `@any` 补全列出全部条目，选中 + 消息 → 投递到预绑定会话，驿站可查、回信回流；
-3. 用户自有 agents 文件零触碰（测试断言）。
+Codex 那边的自定义 agent 是 TOML，`@` 的行为没有验证过，目前不生成。

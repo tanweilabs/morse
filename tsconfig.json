@@ -1,19 +1,25 @@
+// The client build: src/*.ts → dist/ (committed with the source; `npm run build`).
+// Tests are not compiled here — vitest runs them from source. relay-cf/ has its own tsconfig.
 {
+  "include": ["src/**/*.ts"],
   "compilerOptions": {
-    "target": "ES2022",
+    // Node 22 runs it as ES modules ("type": "module"), so imports carry their .js suffix
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "target": "ES2022",
     "lib": ["ES2022"],
-    "outDir": "dist",
+
+    // output: JS plus typings and source maps beside each file
     "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "sourceMap": true,
+
+    // checking: strict, and an index or an optional property is not trusted to be there
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
-    "declaration": true,
-    "sourceMap": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true
-  },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  }
 }

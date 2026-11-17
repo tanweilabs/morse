@@ -4,130 +4,119 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   createCodexLiveness,
+  isSessionLive,
+  liveClaudeSessions,
   parseCodexLockHolders,
   parseLiveClaudeSessions,
 } from '../src/daemon/session-liveness.js';
 
-// Real `ps -o command` shapes: an interactive Claude uses `--resume=<uuid>` (an `=`);
-// Morse's own headless delivery uses `--resume <uuid>` (a space). Only the former
-// means "a human has this session open" — the dispatcher must skip resume-delivery to it.
-const INTERACTIVE =
-  '/Applications/Claude.app/.../claude --output-format stream-json --verbose --resume=43ac9165-2caf-43ff-b3dc-e3a0e39e432b --allowedTools mcp__x';
-const DELIVERY =
-  'claude -p --resume 1157e30d-7a87-4215-8cfa-a275edbd9480 [Morse] Cross-agent message …';
+// ADR-023: a Claude session someone has open is not resumed headlessly.
+// ADR-026: a Codex thread with a live writer refuses `codex exec resume`.
 
-describe('parseLiveClaudeSessions', () => {
-  it('picks up interactively-open sessions (--resume=<uuid>)', () => {
-    const live = parseLiveClaudeSessions(`${INTERACTIVE}\nsome other process\n`);
-    expect(live.has('43ac9165-2caf-43ff-b3dc-e3a0e39e432b')).toBe(true);
-    expect(live.size).toBe(1);
+const OPEN_A = 'a1a1a1a1-0000-4000-8000-00000000000a';
+const OPEN_B = 'b2b2b2b2-0000-4000-8000-00000000000b';
+const HEADLESS = 'c3c3c3c3-0000-4000-8000-00000000000c';
+
+describe('parseLiveClaudeSessions (ps -o command output)', () => {
+  it('finds every --resume=<uuid>, and nothing in a headless `--resume <uuid>` delivery', () => {
+    const ps = [
+      'COMMAND',
+      `/opt/claude/bin/claude --resume=${OPEN_A} --output-format stream-json`,
+      `claude -p --resume ${HEADLESS} "[Morse] message"`,
+      `node /x/claude.js --verbose --resume=${OPEN_B}`,
+      `/opt/claude/bin/claude --resume=${OPEN_A}`, // the same session twice
+      'zsh',
+    ].join('\n');
+    expect(parseLiveClaudeSessions(ps)).toEqual(new Set([OPEN_A, OPEN_B]));
   });
 
-  it('does NOT treat our own headless `-p --resume <uuid>` delivery as live', () => {
-    const live = parseLiveClaudeSessions(`${DELIVERY}\n`);
-    expect(live.has('1157e30d-7a87-4215-8cfa-a275edbd9480')).toBe(false);
-    expect(live.size).toBe(0);
-  });
-
-  it('collects multiple live sessions and ignores noise', () => {
-    const live = parseLiveClaudeSessions(
-      `${INTERACTIVE}\n${DELIVERY}\nfoo --resume=11111111-2222-4333-8444-555555555555 bar\n`,
-    );
-    expect(live).toEqual(
-      new Set(['43ac9165-2caf-43ff-b3dc-e3a0e39e432b', '11111111-2222-4333-8444-555555555555']),
-    );
-  });
-
-  it('returns an empty set for empty/garbage input', () => {
+  it('ignores ids that are not lowercase UUIDs, and empty input', () => {
+    expect(parseLiveClaudeSessions('claude --resume=not-a-uuid\nclaude --resume=A1A1A1A1-0000-4000-8000-00000000000A').size).toBe(0);
     expect(parseLiveClaudeSessions('').size).toBe(0);
-    expect(parseLiveClaudeSessions('no resume here at all').size).toBe(0);
   });
 });
 
-// ADR-026: a Codex thread has a live writer while `<CODEX_HOME>/thread-writer-locks/<id>.lock`
-// is flock-held (upstream codex-rs/rollout/src/writer_lock.rs). Real `lsof -F n` output
-// from 2026-10-12: Codex Desktop's app-server (pid 1220) holding two thread locks.
-const LSOF_REAL = [
-  'p1220',
-  'f48',
-  'n/Users/me/.codex/thread-writer-locks/019ef16c-eff8-7053-946b-5ef73e1e1f41.lock',
-  'f74',
-  'n019f5bf9-e99a-7503-8faf-eba4e9949715.lock', // lsof echoes relative paths as given
-  '',
-].join('\n');
+describe('liveClaudeSessions / isSessionLive (the real machine)', () => {
+  it('answer with a set, the same one while cached, and never claim a random session is live', () => {
+    let t = 1_000_000;
+    const first = liveClaudeSessions(() => t);
+    expect(first).toBeInstanceOf(Set);
+    t += 1_000;
+    expect(liveClaudeSessions(() => t)).toBe(first);
+    expect(isSessionLive('ffffffff-ffff-4fff-8fff-ffffffffffff', () => t)).toBe(false);
+  });
+});
 
-describe('parseCodexLockHolders', () => {
-  it('extracts thread ids of held writer locks from `lsof -F n` output', () => {
-    expect(parseCodexLockHolders(LSOF_REAL)).toEqual(
-      new Set(['019ef16c-eff8-7053-946b-5ef73e1e1f41', '019f5bf9-e99a-7503-8faf-eba4e9949715']),
-    );
+describe('parseCodexLockHolders (lsof -F n output)', () => {
+  const T1 = '019a0000-1111-7111-8111-111111111111';
+  const T2 = '019a0000-2222-7222-8222-222222222222';
+
+  it('takes thread ids from the name (n…) lines, absolute or relative', () => {
+    const out = ['p501', 'f12', `n/Users/me/.codex/thread-writer-locks/${T1}.lock`, 'f13', `n${T2}.lock`, ''].join('\n');
+    expect(parseCodexLockHolders(out)).toEqual(new Set([T1, T2]));
   });
 
-  it('ignores pid/fd lines, the coordination lock and non-thread files', () => {
-    const out = 'p1\nf3\nn/x/thread-writer-locks/.coordination.lock\nn/x/other.lock\nn/x/foo.txt\n';
+  it('ignores pid/fd lines, other lock files and other files', () => {
+    const out = [`p${T1}.lock`, `f${T1}.lock`, 'n/x/.coordination.lock', 'n/x/session.lock', `n/x/${T1}.lock.bak`, 'n/x/readme.txt'].join('\n');
     expect(parseCodexLockHolders(out).size).toBe(0);
-    expect(parseCodexLockHolders('').size).toBe(0);
   });
 });
 
 describe('createCodexLiveness', () => {
-  const T1 = '019ef16c-eff8-7053-946b-5ef73e1e1f41';
-  const T2 = '01a0b5e0-3622-7a01-9c39-5740ca342be2';
-  const lockDir = () => mkdtempSync(join(tmpdir(), 'anytoany-codexlocks-'));
+  const T1 = '019a0000-1111-7111-8111-111111111111';
+  const T2 = '019a0000-2222-7222-8222-222222222222';
+  const locks = (...names: string[]) => {
+    const dir = mkdtempSync(join(tmpdir(), 'morse-codex-locks-'));
+    for (const n of names) writeFileSync(join(dir, n), '');
+    return dir;
+  };
 
-  it('reports a thread live only when its lock file is actually held (stale crash leftovers are not)', () => {
-    const dir = lockDir();
-    writeFileSync(join(dir, `${T1}.lock`), '');
-    writeFileSync(join(dir, `${T2}.lock`), ''); // orphan from a crashed writer — nobody holds it
-    writeFileSync(join(dir, '.coordination.lock'), '');
-    const asked: string[][] = [];
-    const live = createCodexLiveness({
-      lockDir: dir,
-      holders: (paths) => {
-        asked.push(paths);
-        return `p1220\nf48\nn${join(dir, `${T1}.lock`)}\n`;
-      },
-    });
-    expect(live()).toEqual(new Set([T1]));
-    // only thread lock files are probed, by absolute path
-    expect([...(asked[0] ?? [])].sort()).toEqual([join(dir, `${T1}.lock`), join(dir, `${T2}.lock`)].sort());
+  it('asks about the thread lock files only, by full path, and reports the held ones (an orphaned file is not live)', () => {
+    const dir = locks(`${T1}.lock`, `${T2}.lock`, '.coordination.lock', 'notes.txt');
+    let lsofRuns = 0;
+    const probed: string[] = [];
+    const held = join(dir, `${T2}.lock`);
+    const live = createCodexLiveness({ lockDir: dir, holders: (files) => (lsofRuns++, probed.push(...files), `p77\nf9\nn${held}\n`) });
+    expect(live()).toEqual(new Set([T2]));
+    expect(lsofRuns).toBe(1);
+    expect(probed.sort()).toEqual([join(dir, `${T1}.lock`), held].sort());
   });
 
-  it('does not spawn lsof at all when there are no thread lock files', () => {
-    const dir = lockDir();
-    writeFileSync(join(dir, '.coordination.lock'), '');
-    let calls = 0;
-    const live = createCodexLiveness({ lockDir: dir, holders: () => (calls++, '') });
+  it('no thread lock files: lsof is not run at all', () => {
+    let runs = 0;
+    const live = createCodexLiveness({ lockDir: locks('.coordination.lock'), holders: () => (runs++, '') });
     expect(live().size).toBe(0);
-    expect(calls).toBe(0);
+    expect(runs).toBe(0);
   });
 
-  it('is best-effort: a missing lock dir or a failing lsof yields an empty set', () => {
-    const missing = createCodexLiveness({ lockDir: join(tmpdir(), 'anytoany-no-such-dir-xyz'), holders: () => 'n/x/' + T1 + '.lock' });
+  it('a missing folder or a failing lsof: nothing is live', () => {
+    const missing = createCodexLiveness({ lockDir: join(tmpdir(), 'morse-no-codex-locks-here'), holders: () => `n${T1}.lock` });
     expect(missing().size).toBe(0);
-    const dir = lockDir();
-    writeFileSync(join(dir, `${T1}.lock`), '');
-    const broken = createCodexLiveness({
-      lockDir: dir,
+    const failing = createCodexLiveness({
+      lockDir: locks(`${T1}.lock`),
       holders: () => {
-        throw new Error('lsof: command not found');
+        throw new Error('spawn lsof ENOENT');
       },
     });
-    expect(broken().size).toBe(0);
+    expect(failing().size).toBe(0);
   });
 
-  it('caches for the TTL so the dispatch hot path stays cheap', () => {
-    const dir = lockDir();
-    writeFileSync(join(dir, `${T1}.lock`), '');
-    let calls = 0;
-    let t = 0;
-    const live = createCodexLiveness({ lockDir: dir, ttlMs: 2_000, holders: () => (calls++, `n${T1}.lock`) });
-    live(() => t);
-    t = 1_999;
-    live(() => t);
-    expect(calls).toBe(1);
-    t = 2_000;
-    live(() => t);
-    expect(calls).toBe(2);
+  it('reuses the answer for ttlMs, then asks again', () => {
+    let runs = 0;
+    let t = 50;
+    const live = createCodexLiveness({ lockDir: locks(`${T1}.lock`), ttlMs: 100, holders: () => (runs++, `n${T1}.lock`) });
+    const clock = () => t;
+    expect(live(clock)).toEqual(new Set([T1]));
+    t = 149;
+    live(clock);
+    expect(runs).toBe(1);
+    t = 150;
+    live(clock);
+    expect(runs).toBe(2);
+  });
+
+  it('the default holders really run lsof: a lock file nobody holds is not live', () => {
+    const live = createCodexLiveness({ lockDir: locks(`${T1}.lock`) });
+    expect(live().has(T1)).toBe(false);
   });
 });

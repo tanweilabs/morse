@@ -1,14 +1,14 @@
 name: CI macOS
 
-# Opt-in macOS coverage (ADR-015). NOT on every push — macOS runners bill at
-# 10x. Runs weekly and on demand so macOS-specific regressions in the unit
-# suite (path handling, better-sqlite3 native build) are still caught, without
-# taxing the account's shared Actions minutes on every commit.
+# The suite on macOS, once a week and whenever someone starts it by hand — never per push:
+# a macOS runner minute is billed 10x (ADR-015, CLAUDE.md rule 7). What it is there to catch
+# is what only shows up on a Mac: path handling, and better-sqlite3 building or loading its
+# native module. Cost: one run a week.
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 1' # Mondays 03:00 UTC
+    - cron: '0 3 * * 1' # every Monday, 03:00 UTC
+  workflow_dispatch:
 
 concurrency:
   group: ci-macos-${{ github.ref }}
@@ -19,11 +19,16 @@ jobs:
     name: node 22 / macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Node 22, with the npm cache
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
+      - name: Install from the lockfile
+        run: npm ci
+      - name: Build (tsc)
+        run: npm run build
+      - name: Test (vitest)
+        run: npm test

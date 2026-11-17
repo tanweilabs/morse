@@ -1,50 +1,52 @@
 import type { ExecFn } from './types.js';
 
-/**
- * Pre-send CLI version guard (ADR-025).
+/*
+ * ADR-025 — check the CLI before a headless resume.
  *
- * Headless delivery resumes a session with the GLOBAL CLI (`claude -p --resume`,
- * `codex exec resume`), but the session itself is usually written by the desktop
- * App, which bundles its own — often newer — CLI. An older CLI resuming a session
- * a newer one wrote fails, frequently as a bare "exit 1" with an empty stderr
- * (verified 2026-10-12: CLI 2.1.287 vs App 2.1.295 dead-lettered d00591bc 3×).
- * The ADR-022 pull hook then quietly recovered the message, hiding the cause.
- * So: compare before sending, and fail loudly with the upgrade command.
+ * Morse resumes sessions with the globally installed CLI, while the sessions themselves are
+ * mostly written by a desktop App that ships its own, frequently newer, copy. When the
+ * global CLI is behind, the resume fails — often as nothing more than "exit 1" — and the
+ * pull hook later picks the message up anyway, so the real cause never surfaces (seen
+ * 2026-10-12: CLI 2.1.287 against App 2.1.295, one message dead-lettered after three tries).
+ * Comparing the two before sending turns that into one clear error with the fix in it.
  */
 
-/** Stable prefix: the server, notifier and prompt hook key off it. */
+/** Every refusal starts with this; the server, the notifier and the prompt hook match on it. */
 export const VERSION_MISMATCH = 'version_mismatch';
 
-const CORE_RE = /(\d+)\.(\d+)\.(\d+)/;
-const DEFAULT_TTL_MS = 60_000;
-const PROBE_TIMEOUT_MS = 10_000;
+type Core = [major: number, minor: number, patch: number];
 
-/** Numeric `major.minor.patch` core of any version-bearing string; prerelease is ignored. */
-export function parseVersion(raw: string): [number, number, number] | null {
-  const m = CORE_RE.exec(raw);
-  if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3])];
+const PROBE_TTL_MS = 60_000;
+const ASK_TIMEOUT_MS = 10_000;
+
+/**
+ * The `major.minor.patch` numbers in a version string such as "codex-cli 0.157.1" or
+ * "2.1.296 (Claude Code)" — the first such triple wins. Prerelease and build tags are not
+ * part of the comparison. null when the string holds no triple.
+ */
+export function parseVersion(raw: string): Core | null {
+  const found = raw.match(/(\d+)\.(\d+)\.(\d+)/);
+  return found ? [Number(found[1]), Number(found[2]), Number(found[3])] : null;
+}
+
+/** Negative, zero or positive as `a` sorts before, with, or after `b`. */
+function compare(a: Core, b: Core): number {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 }
 
 /**
- * True only when the CLI is strictly older than the session's writer. A newer CLI
- * (the common case after an auto-update) resumes older sessions fine, and an
- * unparseable side never blocks — the delivery's own error handling takes over.
+ * Should this CLI be kept from resuming what `writerVersion` wrote? Only when it is
+ * strictly older. Newer CLIs read older sessions fine (the usual state after an update),
+ * and if either side cannot be read the delivery is not blocked here — its own error
+ * handling deals with whatever happens.
  */
 export function isCliOlder(cliVersion: string, writerVersion: string): boolean {
-  const cli = parseVersion(cliVersion);
-  const writer = parseVersion(writerVersion);
-  return cli !== null && writer !== null && compareCores(cli, writer) < 0;
+  const [cli, writer] = [cliVersion, writerVersion].map(parseVersion);
+  if (!cli || !writer) return false;
+  return compare(cli, writer) < 0;
 }
 
-function compareCores(a: [number, number, number], b: [number, number, number]): number {
-  for (let i = 0; i < 3; i++) {
-    if (a[i]! !== b[i]!) return a[i]! - b[i]!;
-  }
-  return 0;
-}
-
-/** One observation: `originator` (e.g. 'Codex Desktop') was running `version` at `at` (epoch ms). */
+/** A sighting: at time `at` (epoch ms), `originator` (say 'Codex Desktop') was at `version`. */
 export interface WriterSample {
   originator: string;
   version: string;
@@ -52,11 +54,12 @@ export interface WriterSample {
 }
 
 /**
- * Who most plausibly wrote a session last. Codex records `cli_version` only once,
- * when the thread is created — a months-old Desktop thread still says 0.144.2 while
- * today's Desktop (0.162.0-alpha) writes it daily. So take the highest version the
- * same originator was seen running at or before the session's last activity, never
- * lower than the session's own record. Unknown originator → the own record as-is.
+ * The version that most plausibly wrote a session last. Codex stamps `cli_version` into a
+ * thread once, at creation, so a Desktop thread from months ago still claims an old version
+ * while today's Desktop keeps writing to it. Every sighting of the same originator up to the
+ * session's last activity is a version that may have written it; the highest of those and
+ * the session's own record is the answer. With no originator there is nothing to go on but
+ * the own record.
  */
 export function inferWriterVersion(
   own: string | undefined,
@@ -65,70 +68,82 @@ export function inferWriterVersion(
   samples: readonly WriterSample[],
 ): string | undefined {
   if (!originator) return own;
-  let best = own;
-  let bestCore = own ? parseVersion(own) : null;
-  for (const s of samples) {
-    if (s.originator !== originator || s.at > lastActiveAt) continue;
-    const core = parseVersion(s.version);
-    if (core && (!bestCore || compareCores(core, bestCore) > 0)) {
-      best = s.version;
-      bestCore = core;
-    }
+  const candidates = samples.filter((s) => s.originator === originator && s.at <= lastActiveAt).map((s) => s.version);
+  let winner = own;
+  let winnerCore = own === undefined ? null : parseVersion(own);
+  for (const version of candidates) {
+    const core = parseVersion(version);
+    if (!core) continue;
+    if (winnerCore && compare(core, winnerCore) <= 0) continue;
+    winner = version;
+    winnerCore = core;
   }
-  return best;
+  return winner;
 }
 
 export type VersionProbe = () => Promise<string | null>;
 
 /**
- * `<cmd> --version`, cached for `ttlMs` so a hot dispatch loop doesn't spawn on
- * every message, yet an operator's upgrade takes effect within a minute — no
- * daemon restart needed. A missing/failing CLI yields null (= don't block).
+ * A memoised `<cmd> --version`. Within `ttlMs` of the last ask the remembered answer is
+ * returned, so a busy dispatch loop does not spawn per message; after that it asks again,
+ * so an upgrade counts within a minute without restarting the daemon. A CLI that is
+ * missing, fails or prints nothing answers null, which never blocks a delivery.
  */
 export function createVersionProbe(
   exec: ExecFn,
   cmd: string,
   opts: { ttlMs?: number; now?: () => number } = {},
 ): VersionProbe {
-  const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-  const now = opts.now ?? Date.now;
-  let cached: { at: number; value: string | null } | null = null;
-  return async () => {
-    if (cached && now() - cached.at <= ttlMs) return cached.value;
-    let value: string | null = null;
+  const ttlMs = opts.ttlMs ?? PROBE_TTL_MS;
+  const clock = opts.now ?? Date.now;
+  let remembered: { askedAt: number; answer: string | null } | undefined;
+
+  const ask = async (): Promise<string | null> => {
     try {
-      const { stdout, code } = await exec(cmd, ['--version'], { timeoutMs: PROBE_TIMEOUT_MS });
-      value = code === 0 && stdout.trim() ? stdout.trim() : null;
+      const run = await exec(cmd, ['--version'], { timeoutMs: ASK_TIMEOUT_MS });
+      const text = run.stdout.trim();
+      return run.code === 0 && text !== '' ? text : null;
     } catch {
-      value = null;
+      return null;
     }
-    cached = { at: now(), value };
-    return value;
+  };
+
+  return async () => {
+    if (remembered && clock() - remembered.askedAt <= ttlMs) return remembered.answer;
+    const answer = await ask();
+    remembered = { askedAt: clock(), answer };
+    return answer;
   };
 }
 
+/** What the refusal message names for one agent. */
 export interface VersionGuardSpec {
-  /** CLI binary Morse delivers with, e.g. 'codex'. */
+  /** The CLI Morse runs for delivery, e.g. 'codex'. */
   cli: string;
-  /** What usually writes these sessions, for the human-facing message. */
+  /** What normally writes the sessions, as people know it. */
   app: string;
-  /** Exact command the operator should run. */
+  /** The command that fixes it, verbatim. */
   upgrade: string;
 }
 
-/** null = OK to deliver; otherwise a `version_mismatch: …` error for the sender. */
+function refusal(spec: VersionGuardSpec, cliVersion: string, writerVersion: string): string {
+  const sentences = [
+    `${VERSION_MISMATCH}: the ${spec.cli} CLI Morse delivers with (${cliVersion}) is older than the ${spec.app} that last wrote this session (${writerVersion}).`,
+    'Resuming it with the older CLI fails (often a bare "exit 1"), so the message was NOT sent.',
+    `Ask the operator to upgrade: ${spec.upgrade} — then resend (a dead-lettered one can be retried from the web console: morse console).`,
+    'See ADR-025.',
+  ];
+  return sentences.join(' ');
+}
+
+/** null when delivery may go ahead; otherwise the `version_mismatch: …` text for the sender. */
 export async function checkCliVersion(
   probe: VersionProbe,
   spec: VersionGuardSpec,
   writerVersion: string | undefined,
 ): Promise<string | null> {
-  if (!writerVersion) return null;
-  const cliVersion = await probe();
-  if (!cliVersion || !isCliOlder(cliVersion, writerVersion)) return null;
-  return (
-    `${VERSION_MISMATCH}: the ${spec.cli} CLI Morse delivers with (${cliVersion}) is older than the ` +
-    `${spec.app} that last wrote this session (${writerVersion}). Resuming it with the older CLI fails ` +
-    `(often a bare "exit 1"), so the message was NOT sent. Ask the operator to upgrade: ${spec.upgrade} ` +
-    `— then resend (a dead-lettered one can be retried from the web console: morse console). See ADR-025.`
-  );
+  // nothing recorded about the writer: nothing to compare, and no reason to spawn the CLI
+  if (writerVersion === undefined || writerVersion === '') return null;
+  const installed = await probe();
+  return installed && isCliOlder(installed, writerVersion) ? refusal(spec, installed, writerVersion) : null;
 }

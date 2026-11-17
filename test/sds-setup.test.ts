@@ -1,116 +1,161 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { externalHeaderPath, externalTokenPath } from '../src/daemon/local-api.js';
 import {
   applyChanges,
+  defaultAppHome,
   detectSds,
   installedSdsPort,
   planSdsInstall,
   planSdsUninstall,
-  SDS_AGENT,
   removeMarkedBlock,
   resolveSdsPaths,
+  SDS_AGENT,
+  sdsSkillMarkdown,
   upsertMarkedBlock,
 } from '../src/integrations/sds.js';
-import { externalHeaderPath, externalTokenPath } from '../src/daemon/local-api.js';
 
-/**
- * ADR-024: hooking 闪电说 up means writing three things into ITS data directory.
- * Everything here must be surgical — the user's own skills, skill toggles and
- * AGENTS.md content are not ours to touch.
- */
+// ADR-024: `morse connect sds` writes three things into 闪电说's own data folder —
+// the skill, its on-switch, a block in AGENTS.md — and nothing else of the app's.
+
+const OPEN = '<!-- anytoany:begin -->';
+const CLOSE = '<!-- anytoany:end -->';
+const KEY = 'voice_assistant/anytoany';
 
 let appHome: string;
 beforeEach(() => {
-  appHome = mkdtempSync(join(tmpdir(), 'anytoany-sds-'));
+  appHome = mkdtempSync(join(tmpdir(), 'morse-sds-app-'));
   mkdirSync(join(appHome, 'workspace'), { recursive: true });
 });
 
 const paths = () => resolveSdsPaths({ appHome });
 const install = () => planSdsInstall(paths());
+const read = (file: string) => readFileSync(file, 'utf8');
+const json = (file: string) => JSON.parse(read(file)) as Record<string, { enabled: boolean; created_at: number }>;
+const writeJson = (file: string, value: unknown) => {
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, JSON.stringify(value));
+};
 
-describe('resolveSdsPaths', () => {
-  it('defaults the workspace to <appHome>/workspace', () => {
-    const p = paths();
-    expect(p.workspace).toBe(join(appHome, 'workspace'));
-    expect(p.skillFile).toBe(join(appHome, 'workspace', 'library', 'skills', 'anytoany', 'SKILL.md'));
-    expect(p.stateFile).toBe(join(appHome, 'skills', 'skills-state.json'));
-    expect(p.agentsFile).toBe(join(appHome, 'workspace', 'AGENTS.md'));
+describe('where things go', () => {
+  it('the app folder defaults to ~/Library/Application Support/Shandianshuo', () => {
+    expect(defaultAppHome('/Users/me')).toBe('/Users/me/Library/Application Support/Shandianshuo');
+    expect(defaultAppHome()).toBe(join(homedir(), 'Library', 'Application Support', 'Shandianshuo'));
+    expect(resolveSdsPaths({ home: '/Users/me' }).appHome).toBe('/Users/me/Library/Application Support/Shandianshuo');
   });
 
-  // data_paths.rs:348-368 — the user can relocate the workspace, so the path
-  // must never be hardcoded.
-  it('honours the workspace-location migration marker', () => {
-    const moved = join(appHome, 'elsewhere');
-    mkdirSync(join(appHome, 'migrations'), { recursive: true });
-    writeFileSync(
-      join(appHome, 'migrations', 'workspace-location-v1.json'),
-      JSON.stringify({ workspacePath: moved }),
-      'utf8',
-    );
-    expect(resolveSdsPaths({ appHome }).workspace).toBe(moved);
+  it('skill under <workspace>/library/skills/anytoany, switches in <app>/skills, AGENTS.md in the workspace', () => {
+    const ws = join(appHome, 'workspace');
+    expect(paths()).toEqual({
+      appHome,
+      workspace: ws,
+      skillDir: join(ws, 'library', 'skills', 'anytoany'),
+      skillFile: join(ws, 'library', 'skills', 'anytoany', 'SKILL.md'),
+      stateFile: join(appHome, 'skills', 'skills-state.json'),
+      agentsFile: join(ws, 'AGENTS.md'),
+    });
   });
 
-  it('falls back to the default when the marker is unreadable', () => {
-    mkdirSync(join(appHome, 'migrations'), { recursive: true });
-    writeFileSync(join(appHome, 'migrations', 'workspace-location-v1.json'), '{broken', 'utf8');
-    expect(resolveSdsPaths({ appHome }).workspace).toBe(join(appHome, 'workspace'));
+  it('follows a workspace the user moved (the app\'s migration marker); a broken or empty marker is ignored', () => {
+    const marker = join(appHome, 'migrations', 'workspace-location-v1.json');
+    writeJson(marker, { workspacePath: '/Volumes/data/sds-ws' });
+    expect(paths().workspace).toBe('/Volumes/data/sds-ws');
+    expect(paths().agentsFile).toBe('/Volumes/data/sds-ws/AGENTS.md');
+    for (const bad of ['{', JSON.stringify({ workspacePath: '' }), JSON.stringify({ workspacePath: 3 }), 'null']) {
+      writeFileSync(marker, bad);
+      expect(paths().workspace).toBe(join(appHome, 'workspace'));
+    }
   });
 });
 
-describe('marked-block helpers (AGENTS.md)', () => {
-  it('appends a fenced block to existing content, preserving it verbatim', () => {
-    const before = '# 我的习惯\n\n- 用中文回我\n';
-    const after = upsertMarkedBlock(before, 'HELLO');
-    expect(after.startsWith(before)).toBe(true);
-    expect(after).toContain('<!-- anytoany:begin -->');
-    expect(after).toContain('HELLO');
-    expect(after).toContain('<!-- anytoany:end -->');
+describe('upsertMarkedBlock / removeMarkedBlock', () => {
+  it('adds the block after the user\'s text with one blank line between, ending in a newline', () => {
+    expect(upsertMarkedBlock('', 'B')).toBe(`${OPEN}\nB\n${CLOSE}\n`);
+    expect(upsertMarkedBlock('mine\n', 'B')).toBe(`mine\n\n${OPEN}\nB\n${CLOSE}\n`);
+    expect(upsertMarkedBlock('mine', 'B')).toBe(`mine\n\n${OPEN}\nB\n${CLOSE}\n`);
   });
 
-  it('replaces only the block on a second pass (idempotent)', () => {
-    const once = upsertMarkedBlock('# 我的习惯\n', 'V1');
-    const twice = upsertMarkedBlock(once, 'V2');
-    expect(twice).toContain('V2');
-    expect(twice).not.toContain('V1');
-    expect(twice).toContain('# 我的习惯');
-    expect(twice.match(/anytoany:begin/g)).toHaveLength(1);
-    expect(upsertMarkedBlock(twice, 'V2')).toBe(twice);
+  it('a second pass replaces just the block body, in place', () => {
+    const doc = `top\n\n${OPEN}\nold\n${CLOSE}\nbottom\n`;
+    expect(upsertMarkedBlock(doc, 'new')).toBe(`top\n\n${OPEN}\nnew\n${CLOSE}\nbottom\n`);
+    const once = upsertMarkedBlock('# notes\n', 'same');
+    expect(upsertMarkedBlock(once, 'same')).toBe(once);
   });
 
-  it('removes only the block, leaving the user content intact', () => {
-    const doc = upsertMarkedBlock('# 我的习惯\n\n- 用中文回我\n', 'OURS');
-    const cleaned = removeMarkedBlock(doc);
-    expect(cleaned).not.toContain('anytoany');
-    expect(cleaned).toContain('- 用中文回我');
-  });
-
-  it('removing from a document without our block changes nothing', () => {
-    const doc = '# 我的习惯\n';
+  it('fences out of order are not a block: the new one is appended', () => {
+    const doc = `${CLOSE}\n${OPEN}\n`;
+    expect(upsertMarkedBlock(doc, 'B')).toBe(`${doc}\n${OPEN}\nB\n${CLOSE}\n`);
     expect(removeMarkedBlock(doc)).toBe(doc);
   });
+
+  it('removing takes out the block and the blank lines around it, nothing else', () => {
+    expect(removeMarkedBlock(`top\n\n\n${OPEN}\nx\n${CLOSE}\n\nbottom\n`)).toBe('top\nbottom\n');
+    expect(removeMarkedBlock(upsertMarkedBlock('mine\n', 'x'))).toBe('mine\n');
+    expect(removeMarkedBlock(`${OPEN}\nx\n${CLOSE}\n`)).toBe('');
+    expect(removeMarkedBlock('just mine\n')).toBe('just mine\n');
+  });
 });
 
-describe('planSdsInstall — dry run', () => {
-  it('plans three changes and writes nothing', () => {
+describe('planSdsInstall', () => {
+  it('three planned writes — skill, switch, AGENTS.md — all "create" on a fresh app, nothing written yet', () => {
     const p = paths();
-    const changes = install();
-
-    expect(changes.map((c) => c.path)).toEqual([p.skillFile, p.stateFile, p.agentsFile]);
-    expect(changes.every((c) => c.action === 'create')).toBe(true);
-    expect(existsSync(p.skillFile)).toBe(false);
-    expect(existsSync(p.stateFile)).toBe(false);
-    expect(existsSync(p.agentsFile)).toBe(false);
+    const plan = install();
+    expect(plan.map((c) => [c.path, c.action])).toEqual([
+      [p.skillFile, 'create'],
+      [p.stateFile, 'create'],
+      [p.agentsFile, 'create'],
+    ]);
+    expect(plan.every((c) => typeof c.note === 'string' && c.note.length > 0)).toBe(true);
+    for (const c of plan) expect(existsSync(c.path)).toBe(false);
   });
 
-  it('the planned skill teaches the HTTP calls, not the anyd CLI', () => {
-    const skill = install()[0]?.content ?? '';
-    expect(skill).toMatch(/^---\nname: anytoany\n/); // frontmatter for the DSH skill loader
-    expect(skill).toContain('127.0.0.1:7433/api/inbox');
-    expect(skill).toContain('127.0.0.1:7433/api/send');
-    expect(skill).toContain('DSH_SESSION_ID');
-    expect(skill).not.toMatch(/\banyd (send|pull)\b/); // the sandbox blocks the CLI
+  it('the skill is a DSH skill named anytoany that teaches the local HTTP API, not the CLI', () => {
+    const skill = install()[0]!.content!;
+    expect(skill.startsWith('---\nname: anytoany\ndescription: ')).toBe(true);
+    expect(skill).toBe(sdsSkillMarkdown());
+    for (const call of ['127.0.0.1:7433/api/inbox', '127.0.0.1:7433/api/sessions?q=', '127.0.0.1:7433/api/send']) expect(skill).toContain(call);
+    expect(skill).toContain('SID="${DSH_SESSION_ID:-${SHANDIANSHUO_DSH_SESSION_ID:-main}}"');
+    expect(skill).toContain(String.raw`-d "{\"agent\":\"sds\",\"sessionId\":\"$SID\",\"register\":true,\"title\":\"闪电说助手\"}"`);
+    expect(skill).toContain(String.raw`\"from\":{\"agent\":\"sds\",\"sessionId\":\"$SID\"}`);
+    expect(skill).not.toMatch(/\banyd (send|pull|read)\b/);
+  });
+
+  it('the port is written into every call, and read back from an installed skill', () => {
+    const plan = planSdsInstall(paths(), { port: 7611 });
+    expect(plan[0]!.content).not.toContain(':7433/');
+    expect(plan[2]!.content).toContain('127.0.0.1:7611/api/inbox');
+    expect(installedSdsPort(paths())).toBeNull();
+    applyChanges(plan);
+    expect(installedSdsPort(paths())).toBe(7611);
+  });
+
+  it('turns the switch on, keeping every other switch and the first install\'s date; a new one is stamped in seconds', () => {
+    const p = paths();
+    writeJson(p.stateFile, { 'voice_input/整理': { enabled: false, created_at: 3 }, [KEY]: { enabled: false, created_at: 99 } });
+    const state = planSdsInstall(p, { now: () => 5_000_000 })[1]!.content!;
+    expect(state.endsWith('}\n')).toBe(true);
+    expect(JSON.parse(state)).toEqual({ 'voice_input/整理': { enabled: false, created_at: 3 }, [KEY]: { enabled: true, created_at: 99 } });
+
+    writeFileSync(p.stateFile, 'garbage');
+    expect(JSON.parse(planSdsInstall(p, { now: () => 5_000_999 })[1]!.content!)).toEqual({ [KEY]: { enabled: true, created_at: 5_000 } });
+  });
+
+  it('keeps the user\'s AGENTS.md text and adds the standing block', () => {
+    const p = paths();
+    writeFileSync(p.agentsFile, '# 我的规矩\n\n- 说中文\n');
+    const agents = install()[2]!;
+    expect(agents.action).toBe('update');
+    expect(agents.content!.startsWith('# 我的规矩\n\n- 说中文\n\n' + OPEN + '\n')).toBe(true);
+    expect(agents.content!.endsWith(CLOSE + '\n')).toBe(true);
+    expect(agents.content).toContain('`anytoany`');
+  });
+
+  it('refuses when the app is not installed', () => {
+    expect(() => planSdsInstall(resolveSdsPaths({ appHome: join(appHome, 'absent') }))).toThrow(
+      `闪电说 not found at ${join(appHome, 'absent')} — install the app first, or pass --app-home`,
+    );
   });
 
   it('(ADR-087) every call carries the app\'s own token — curl reads the header from a file: the token is neither in the instructions nor on a command line', () => {
@@ -147,130 +192,76 @@ describe('planSdsInstall — dry run', () => {
     expect(installedSdsPort(paths())).toBe(7500);
   });
 
-  it('reports the app as missing instead of planning writes', () => {
-    expect(() => planSdsInstall(resolveSdsPaths({ appHome: join(appHome, 'nope') }))).toThrow(/闪电说|not found/i);
-  });
 });
 
-describe('applyChanges — install', () => {
-  it('writes all three files', () => {
+describe('applyChanges', () => {
+  it('writes all three, creating folders; then re-planning finds nothing to do and re-applying changes nothing', () => {
     const p = paths();
     applyChanges(install());
+    expect(read(p.skillFile)).toBe(sdsSkillMarkdown());
+    expect(json(p.stateFile)[KEY]?.enabled).toBe(true);
+    expect(read(p.agentsFile)).toContain(OPEN);
 
-    expect(readFileSync(p.skillFile, 'utf8')).toContain('api/inbox');
-    expect(JSON.parse(readFileSync(p.stateFile, 'utf8'))).toHaveProperty('voice_assistant/anytoany');
-    expect(readFileSync(p.agentsFile, 'utf8')).toContain('anytoany:begin');
+    const again = install();
+    expect(again.map((c) => c.action)).toEqual(['unchanged', 'unchanged', 'unchanged']);
+    const before = again.map((c) => read(c.path));
+    applyChanges(again);
+    expect(again.map((c) => read(c.path))).toEqual(before);
   });
 
-  // storage.rs:253-256 — a user-dropped SKILL.md is DISABLED by default. Without
-  // this key the skill silently never loads.
-  it('enables the skill in skills-state.json', () => {
-    applyChanges(install());
-    const state = JSON.parse(readFileSync(paths().stateFile, 'utf8')) as Record<string, { enabled: boolean }>;
-    expect(state['voice_assistant/anytoany']?.enabled).toBe(true);
-  });
-
-  it('preserves every other key in an existing skills-state.json', () => {
-    const p = paths();
-    mkdirSync(join(appHome, 'skills'), { recursive: true });
-    writeFileSync(
-      p.stateFile,
-      JSON.stringify({
-        'voice_input/自动结构化': { enabled: true, created_at: 0 },
-        'voice_assistant/green-tea-reply': { enabled: false, created_at: 7 },
-      }),
-      'utf8',
-    );
-
-    applyChanges(planSdsInstall(p));
-    const state = JSON.parse(readFileSync(p.stateFile, 'utf8')) as Record<string, { enabled: boolean; created_at: number }>;
-    expect(state['voice_input/自动结构化']).toEqual({ enabled: true, created_at: 0 });
-    expect(state['voice_assistant/green-tea-reply']).toEqual({ enabled: false, created_at: 7 });
-    expect(state['voice_assistant/anytoany']?.enabled).toBe(true);
-  });
-
-  it('preserves the user AGENTS.md content', () => {
-    const p = paths();
-    writeFileSync(p.agentsFile, '# 我的习惯\n\n- 永远用中文\n', 'utf8');
-    applyChanges(planSdsInstall(p));
-    const after = readFileSync(p.agentsFile, 'utf8');
-    expect(after).toContain('- 永远用中文');
-    expect(after).toContain('anytoany:begin');
-  });
-
-  it('is idempotent — re-planning after apply reports no changes', () => {
+  it('a changed skill file is planned as an update', () => {
     const p = paths();
     applyChanges(install());
-    const second = planSdsInstall(p);
-    expect(second.every((c) => c.action === 'unchanged')).toBe(true);
-
-    const before = second.map((c) => readFileSync(c.path, 'utf8'));
-    applyChanges(second);
-    expect(second.map((c) => readFileSync(c.path, 'utf8'))).toEqual(before);
+    writeFileSync(p.skillFile, 'edited by hand');
+    expect(install()[0]?.action).toBe('update');
   });
 });
 
 describe('planSdsUninstall', () => {
-  it('removes our skill, our state key and our AGENTS.md block — nothing else', () => {
+  it('after an install: deletes the skill folder, drops our switch, removes our block — the rest stays', () => {
     const p = paths();
-    writeFileSync(p.agentsFile, '# 我的习惯\n', 'utf8');
-    mkdirSync(join(appHome, 'skills'), { recursive: true });
-    writeFileSync(p.stateFile, JSON.stringify({ 'voice_assistant/mine': { enabled: true, created_at: 1 } }), 'utf8');
-    applyChanges(planSdsInstall(p));
+    writeFileSync(p.agentsFile, '# 我的规矩\n');
+    writeJson(p.stateFile, { 'voice_assistant/other': { enabled: true, created_at: 2 } });
+    applyChanges(install());
 
-    applyChanges(planSdsUninstall(p));
+    const plan = planSdsUninstall(p);
+    expect(plan.map((c) => c.action)).toEqual(['delete', 'update', 'update']);
+    applyChanges(plan);
 
-    expect(existsSync(p.skillFile)).toBe(false);
-    const state = JSON.parse(readFileSync(p.stateFile, 'utf8')) as Record<string, unknown>;
-    expect(state['voice_assistant/anytoany']).toBeUndefined();
-    expect(state['voice_assistant/mine']).toEqual({ enabled: true, created_at: 1 });
-    const agents = readFileSync(p.agentsFile, 'utf8');
-    expect(agents).toContain('# 我的习惯');
-    expect(agents).not.toContain('anytoany');
+    expect(existsSync(p.skillDir)).toBe(false);
+    expect(existsSync(join(p.workspace, 'library', 'skills'))).toBe(true);
+    expect(read(p.stateFile)).toBe(`${JSON.stringify({ 'voice_assistant/other': { enabled: true, created_at: 2 } }, null, 2)}\n`);
+    expect(read(p.agentsFile)).toBe('# 我的规矩\n');
   });
 
-  it('is a no-op when nothing was installed', () => {
-    const changes = planSdsUninstall(paths());
-    expect(changes.every((c) => c.action === 'unchanged')).toBe(true);
-    expect(() => applyChanges(changes)).not.toThrow();
+  it('nothing installed: every entry unchanged, and applying it is harmless', () => {
+    const p = paths();
+    writeFileSync(p.agentsFile, 'mine\n');
+    const plan = planSdsUninstall(p);
+    expect(plan.map((c) => [c.path, c.action])).toEqual([
+      [p.skillFile, 'unchanged'],
+      [p.stateFile, 'unchanged'],
+      [p.agentsFile, 'unchanged'],
+    ]);
+    expect(() => applyChanges(plan)).not.toThrow();
+    expect(read(p.agentsFile)).toBe('mine\n');
   });
 });
 
-describe('detectSds — for `anyd setup` discovery and `anyd doctor`', () => {
-  it('reports the app as absent when the data dir does not exist', () => {
-    const d = detectSds(resolveSdsPaths({ appHome: join(appHome, 'nope') }));
-    expect(d).toMatchObject({ appInstalled: false, skillInstalled: false, skillEnabled: false });
-  });
-
-  it('reports the app present but not yet connected', () => {
-    expect(detectSds(paths())).toMatchObject({
-      appInstalled: true,
-      skillInstalled: false,
-      skillEnabled: false,
-    });
-  });
-
-  it('reports fully connected after an install', () => {
+describe('detectSds (morse setup, morse status --check)', () => {
+  it('no app; app but no skill; skill switched on; skill there but switched off in the app', () => {
+    expect(detectSds(resolveSdsPaths({ appHome: join(appHome, 'absent') }))).toEqual({ appInstalled: false, skillInstalled: false, skillEnabled: false });
+    expect(detectSds(paths())).toEqual({ appInstalled: true, skillInstalled: false, skillEnabled: false });
     applyChanges(install());
-    expect(detectSds(paths())).toMatchObject({
-      appInstalled: true,
-      skillInstalled: true,
-      skillEnabled: true,
-    });
-  });
-
-  // storage.rs:253-256 — the file being present is not enough; the toggle decides
-  // whether DSH ever loads it. A user who disabled it in the UI must show as off.
-  it('separates "file is there" from "actually enabled"', () => {
+    expect(detectSds(paths())).toEqual({ appInstalled: true, skillInstalled: true, skillEnabled: true });
     const p = paths();
-    applyChanges(install());
-    const state = JSON.parse(readFileSync(p.stateFile, 'utf8')) as Record<string, { enabled: boolean }>;
-    state['voice_assistant/anytoany'] = { enabled: false, created_at: 1 };
-    writeFileSync(p.stateFile, JSON.stringify(state), 'utf8');
-
-    expect(detectSds(p)).toMatchObject({ skillInstalled: true, skillEnabled: false });
+    writeJson(p.stateFile, { ...json(p.stateFile), [KEY]: { enabled: false, created_at: 1 } });
+    expect(detectSds(p)).toEqual({ appInstalled: true, skillInstalled: true, skillEnabled: false });
+    writeFileSync(p.stateFile, 'broken');
+    expect(detectSds(p).skillEnabled).toBe(false);
   });
 });
+
 
 describe('(ADR-087) `morse setup` brings an earlier install up to date', () => {
   it('instructions written before the token existed are refreshed — same port, the token made, nothing else touched; a home without the app is left alone', async () => {

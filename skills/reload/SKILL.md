@@ -3,33 +3,33 @@ name: reload
 description: Show the recent cross-agent (Morse) exchange in THIS session — what other agent sessions sent and replied — without restarting the app. Use when the user types /reload, $reload, says "reload", "刷新", "拉一下消息", "看看发生了啥", "有没有漏的", or otherwise wants to see cross-agent activity they can't see in this app. Needed in Codex / Kimi / Z Code, whose interactive UI does not reliably show messages delivered in headless turns (a known Codex bug, openai/codex#28259).
 ---
 
-# reload — show the cross-agent exchange in this session
+# reload — bring the cross-agent exchange into view
 
-Codex / Kimi / Z Code deliver cross-agent messages in **headless turns** and do NOT reliably refresh the interactive UI to show them (known Codex bug: [openai/codex#28259](https://github.com/openai/codex/issues/28259)). The messages are safely on disk — your job is to surface them into the visible conversation.
+Why this exists: Codex, Kimi and Z Code hand cross-agent messages to your session in a **headless turn**, and their app often does not redraw afterwards, so the operator never sees them (for Codex this is a known bug, [openai/codex#28259](https://github.com/openai/codex/issues/28259)). Nothing is lost — every message is in the mailbox on disk. What you do here is copy that exchange into the conversation the operator can actually read.
 
-## When the operator wants to SEE what happened
+## The operator wants to see what went on
 
 Triggers: `/reload`, `$reload`, "reload", "刷新", "拉一下消息", "看看发生了啥", "有没有漏的", or plain `morse read --pull` reported nothing new but they clearly want to review.
 
-1. Run:
-
+**Step 1 — get the recap:**
 ```bash
 morse read --pull --history
 ```
 
-This prints the recent cross-agent exchange in **full** — both directions, oldest→newest, including failed/`dead` messages — read-only, ignoring any "already seen" cursor. (Add `--limit N` for more/fewer.)
+It shows the latest exchange with other sessions **in full**: what was sent and what came back, oldest first, failed and `dead` messages included. It only reads — it does not move any "seen" marker and does not mark anything handled. `--limit N` changes how many messages it goes back.
 
-2. **CRITICAL — paste that output into your visible reply.** Codex / Kimi / Z Code put command output in a **collapsed block the operator does not see**. If you only summarize — or say "shown above" — the operator sees **nothing**, and it looks like reload did nothing. This is the single most common failure. So:
-   - **Reproduce the command's full output verbatim in your reply, inside a fenced code block.** Then add at most a one-line note (e.g. which messages are `dead`/undelivered).
-   - Do NOT re-reply to or re-run those messages — they were already handled. This is a read-only recap so the operator can read the exchange.
+**Step 2 — put the output where the operator can see it.** This is the step that usually goes wrong. In Codex, Kimi and Z Code the output of a command you run is folded away, out of the operator's sight; a summary, or "see the output above", leaves them with an empty screen and reload looks broken. Therefore:
 
-## Checking for NEW messages you must still ACT on
+- Copy the **whole** output, word for word, into your reply as a fenced code block. You may add one short line after it at most (for example, which messages are `dead` or were never delivered).
+- Do not answer those messages again and do not redo their work: they were handled when they arrived. The recap is for reading only.
 
-Different job: to catch messages not yet handled (so you can do the work), run `morse read --pull` (plain). Pending messages are injected in full — act on each per the Morse protocol (`morse reply <id> …` or the `<<<ANYTOANY_REPLY>>> DONE/BLOCKED` verdict). An "Activity digest" is FYI only — do not re-run it.
+## Messages you still have to act on
+
+That is a separate job. To pick up messages nobody has handled yet, so that you can do the work, run `morse read --pull` (plain). Pending messages are injected in full — act on each per the Morse protocol (`morse reply <id> …` or the `<<<ANYTOANY_REPLY>>> DONE/BLOCKED` verdict). An "Activity digest" is FYI only — do not re-run it.
 
 Run `morse read --pull --quiet` **proactively** (silent when nothing new) at the start of a turn while working with a peer, right after messaging a peer, or when the operator asks about another agent.
 
-## Notes
+## Good to know
 
 - The older `morse pull` still works the same.
 - Works with the `morse` daemon down — it reads the mailbox on disk. That's the point: it's a disk pull, minus the restart.

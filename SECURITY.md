@@ -1,8 +1,8 @@
-# Security Policy
+# Security
 
 Morse moves messages between AI agent sessions: on one machine, across your LAN, and between people through a relay. Thanks for helping keep it tight.
 
-## Reporting a vulnerability
+## Report a vulnerability privately
 
 Please **do not** open a public issue for security problems. Use GitHub's [private vulnerability reporting](https://github.com/tanweilabs/morse/security/advisories/new) instead. You should get a response within a few days.
 

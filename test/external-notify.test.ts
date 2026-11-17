@@ -1,180 +1,147 @@
-import { describe, expect, it } from 'vitest';
-import { startExternalInboxNotifier } from '../src/daemon/external-notify.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { startExternalInboxNotifier, type ExternalInboxNotifierOptions } from '../src/daemon/external-notify.js';
 import { createDb } from '../src/mailbox/db.js';
-import { createMailbox } from '../src/mailbox/mailbox.js';
+import { createMailbox, type Mailbox } from '../src/mailbox/mailbox.js';
 import type { ExternalSession } from '../src/registry/external.js';
 
-/**
- * ADR-024: a registered external agent is pull-only, so its mail is never
- * claimed by the dispatcher and never emits a `delivered` event — which is what
- * the normal notifier hangs off (cli.ts). Without this, a reply lands and the
- * operator has no idea. The App itself has no self-drive, so the OS notification
- * IS the wake-up signal.
- */
+// ADR-024: the dispatcher never claims a registered agent's mail, so no `delivered`
+// event fires for it — and the app cannot wake itself. The daemon notifies the
+// operator instead, once per new message.
 
-const SDS: ExternalSession = {
-  agent: 'sds',
-  sessionId: 'shandianshuo-abc',
-  title: '闪电说助手',
-  cwd: '/w/sds',
-  registeredAt: 0,
-  lastSeenAt: 1_000,
+const app: ExternalSession = {
+  agent: 'notes-app',
+  sessionId: 'notes-1',
+  title: 'Notes assistant',
+  cwd: '/w/notes',
+  registeredAt: 1,
+  lastSeenAt: 2,
 };
-const CODEX = { agent: 'codex', sessionId: 'codex-1' };
+const second: ExternalSession = { ...app, agent: 'sds', sessionId: 'sds-main', title: '闪电说助手' };
+const sender = { agent: 'claude', sessionId: 'c1a0de00-0000-4000-8000-00000000000a' };
 
-function fakeNotifier() {
-  const calls: Array<{ agent: string; title: string; sessionId: string; direction: string }> = [];
-  return {
-    calls,
-    sessionActivity: (agent: string, title: string, sessionId: string, direction: 'received' | 'replied') => {
-      calls.push({ agent, title, sessionId, direction });
-    },
-  };
+type Shown = [agent: string, title: string, sessionId: string, direction: string];
+
+function harness(over: Partial<ExternalInboxNotifierOptions> & { registered?: () => ExternalSession[] } = {}) {
+  const mailbox: Mailbox = createMailbox(createDb(':memory:'));
+  const shown: Shown[] = [];
+  const logged: string[] = [];
+  const start = () =>
+    startExternalInboxNotifier({
+      mailbox,
+      listRegistered: over.registered ?? (() => [app]),
+      notifier: { sessionActivity: (...args: Shown) => void shown.push(args) } as ExternalInboxNotifierOptions['notifier'],
+      autoStart: false,
+      onNotify: (s, id) => logged.push(`${s.agent}/${id}`),
+      ...over,
+    });
+  const mail = (to: ExternalSession | { agent: string; sessionId: string }, text = 'hello') =>
+    mailbox.send({ from: sender, to: { agent: to.agent, sessionId: to.sessionId }, text });
+  return { mailbox, shown, logged, start, mail };
 }
 
-describe('external inbox notifier', () => {
-  it('notifies once for a new pending message to a registered session', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const notifier = fakeNotifier();
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [SDS],
-      notifier,
-      autoStart: false,
-    });
+afterEach(() => {
+  vi.useRealTimers();
+});
 
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: '改完了' });
+describe('startExternalInboxNotifier', () => {
+  it('a new message for a registered session: one "received" notification and one log line, never repeated', () => {
+    const h = harness();
+    const n = h.start();
+    const m = h.mail(app);
     n.tick();
-
-    expect(notifier.calls).toHaveLength(1);
-    expect(notifier.calls[0]).toMatchObject({ agent: 'sds', title: '闪电说助手', direction: 'received' });
-
-    n.tick(); // same message again — already announced
-    expect(notifier.calls).toHaveLength(1);
+    n.tick();
+    expect(h.shown).toEqual([['notes-app', 'Notes assistant', 'notes-1', 'received']]);
+    expect(h.logged).toEqual([`notes-app/${m.id}`]);
     n.stop();
   });
 
-  it('reports each announcement through onNotify so the daemon log shows it', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const seen: Array<{ agent: string; id: string }> = [];
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [SDS],
-      notifier: fakeNotifier(),
-      autoStart: false,
-      onNotify: (session, messageId) => seen.push({ agent: session.agent, id: messageId }),
-    });
-
-    const m = mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: '来信' });
+  it('every message counts: two new ones are two notifications, across sessions', () => {
+    const h = harness({ registered: () => [app, second] });
+    const n = h.start();
+    h.mail(app, 'one');
+    h.mail(second, 'two');
+    h.mail(app, 'three');
     n.tick();
-    n.tick();
-
-    expect(seen).toEqual([{ agent: 'sds', id: m.id }]);
+    expect(h.shown.map(([agent]) => agent).sort()).toEqual(['notes-app', 'notes-app', 'sds']);
     n.stop();
   });
 
-  // A daemon restart must not replay every message the agent has not fetched yet.
-  it('treats everything already pending at construction time as already seen', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: 'backlog 1' });
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: 'backlog 2' });
-
-    const notifier = fakeNotifier();
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [SDS],
-      notifier,
-      autoStart: false,
-    });
+  it('mail already waiting when it starts is not announced (a daemon restart replays nothing)', () => {
+    const h = harness();
+    h.mail(app, 'old 1');
+    h.mail(app, 'old 2');
+    const n = h.start();
     n.tick();
-    expect(notifier.calls).toHaveLength(0);
-
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: 'fresh' });
+    expect(h.shown).toEqual([]);
+    h.mail(app, 'new');
     n.tick();
-    expect(notifier.calls).toHaveLength(1);
+    expect(h.shown).toHaveLength(1);
     n.stop();
   });
 
-  it('ignores messages addressed to sessions that are not registered', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const notifier = fakeNotifier();
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [SDS],
-      notifier,
-      autoStart: false,
-    });
-
-    mailbox.send({ from: CODEX, to: { agent: 'claude', sessionId: 'some-claude' }, text: 'not yours' });
-    n.tick();
-    expect(notifier.calls).toHaveLength(0);
-    n.stop();
-  });
-
-  it('does nothing at all when no external agent is registered', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const notifier = fakeNotifier();
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [],
-      notifier,
-      autoStart: false,
-    });
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: 'hi' });
-    n.tick();
-    expect(notifier.calls).toHaveLength(0);
-    n.stop();
-  });
-
-  it('notices an agent registered after the notifier started', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const notifier = fakeNotifier();
+  it('only registered sessions count, and a session registered later is picked up', () => {
     let registered: ExternalSession[] = [];
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => registered,
-      notifier,
-      autoStart: false,
-    });
-
-    mailbox.send({ from: CODEX, to: { agent: 'sds', sessionId: SDS.sessionId }, text: '来了' });
+    const h = harness({ registered: () => registered });
+    const n = h.start();
+    h.mail({ agent: 'claude', sessionId: 'someone-else' });
+    h.mail(app);
     n.tick();
-    expect(notifier.calls).toHaveLength(0);
-
-    registered = [SDS];
+    expect(h.shown).toEqual([]);
+    registered = [app];
     n.tick();
-    expect(notifier.calls).toHaveLength(1);
+    expect(h.shown.map(([, , sid]) => sid)).toEqual(['notes-1']);
     n.stop();
   });
 
-  it('survives a mailbox read error without throwing', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const broken = {
-      ...mailbox,
-      inbox: () => {
-        throw new Error('db locked');
+  it('a message fetched (no longer pending) before the tick is not announced', () => {
+    const h = harness();
+    const n = h.start();
+    const m = h.mail(app);
+    h.mailbox.claimById(m.id);
+    h.mailbox.markDelivered(m.id);
+    n.tick();
+    expect(h.shown).toEqual([]);
+    n.stop();
+  });
+
+  it('a failing mailbox or registry never throws out of start or tick', () => {
+    const failing = harness({
+      mailbox: {
+        inbox: () => {
+          throw new Error('database is locked');
+        },
       },
-    };
-    const notifier = fakeNotifier();
-    const n = startExternalInboxNotifier({
-      mailbox: broken,
-      listRegistered: () => [SDS],
-      notifier,
-      autoStart: false,
     });
-    expect(() => n.tick()).not.toThrow();
-    n.stop();
+    expect(() => failing.start().tick()).not.toThrow();
+    const noRegistry = harness({
+      registered: () => {
+        throw new Error('EACCES');
+      },
+    });
+    expect(() => noRegistry.start().tick()).not.toThrow();
+    expect(failing.shown).toEqual([]);
   });
 
-  it('stop() clears the timer so the process can exit', () => {
-    const mailbox = createMailbox(createDb(':memory:'));
-    const n = startExternalInboxNotifier({
-      mailbox,
-      listRegistered: () => [SDS],
-      notifier: fakeNotifier(),
-      intervalMs: 5,
-    });
-    expect(() => n.stop()).not.toThrow();
-    expect(() => n.stop()).not.toThrow(); // idempotent
+  it('with the timer on it scans every intervalMs (5 s by default) until stopped; stop twice is fine', () => {
+    vi.useFakeTimers();
+    const h = harness({ autoStart: true });
+    const n = h.start();
+    h.mail(app);
+    vi.advanceTimersByTime(4_999);
+    expect(h.shown).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(h.shown).toHaveLength(1);
+    n.stop();
+    n.stop();
+    h.mail(app);
+    vi.advanceTimersByTime(60_000);
+    expect(h.shown).toHaveLength(1);
+
+    const fast = harness({ autoStart: undefined, intervalMs: 10 });
+    const f = fast.start();
+    fast.mail(app);
+    vi.advanceTimersByTime(10);
+    expect(fast.shown).toHaveLength(1);
+    f.stop();
   });
 });

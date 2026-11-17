@@ -1,15 +1,18 @@
 name: CI
 
-# Cost policy (ADR-015): per-push CI runs on Ubuntu only. GitHub bills macOS
-# runners at 10x — and this suite is platform-agnostic (mocked exec, in-memory
-# sqlite), so macOS adds ~no signal per push while costing ~90% of the minutes.
-# macOS coverage lives in ci-macos.yml (weekly + manual). Account Actions minutes
-# are shared across all your private repos, so keep this lean.
+# The check every push to main and every pull request gets: build and run the whole suite
+# once, on Ubuntu with Node 22 — the minimum Node Morse supports (ADR-084).
+#
+# Why only that (ADR-015, CLAUDE.md rule 7): the suite fakes the agent CLIs and the relay and
+# keeps sqlite in memory, so another OS seldom finds anything new here, while a macOS minute is
+# billed 10x and a Windows minute 2x against minutes shared by every private repository of the
+# account. macOS runs weekly in ci-macos.yml, Windows weekly in ci-windows.yml. Adding a runner,
+# a matrix axis or a schedule needs its monthly minute cost written down first.
 
 on:
   push:
     branches: [main]
-    paths-ignore:
+    paths-ignore: # changes to documentation alone run nothing
       - '**/*.md'
       - 'docs/**'
       - 'tasks/**'
@@ -19,26 +22,27 @@ on:
       - 'docs/**'
       - 'tasks/**'
 
-# A newer push to the same ref cancels the older in-flight run — during rapid
-# iteration this alone saved a large share of the wasted minutes.
+# One run per branch or PR: a new push stops the run still going for the previous one.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
-    name: node ${{ matrix.node }} / ubuntu
+    # (this name is the status check GitHub reports — keep it stable)
+    name: node 22 / ubuntu
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [22]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Node 22, with the npm cache
+        uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
+      - name: Install from the lockfile
+        run: npm ci
+      - name: Build (tsc)
+        run: npm run build
+      - name: Test (vitest)
+        run: npm test

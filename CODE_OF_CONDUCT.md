@@ -1,7 +1,7 @@
 # Code of Conduct
 
-This project follows the [Contributor Covenant v2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
+Everyone taking part in Morse — issues, pull requests, discussions, reviews — is expected to follow the [Contributor Covenant, version 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
 
-In short: be respectful, be constructive, assume good faith. Harassment or personal attacks are not tolerated anywhere in the project's spaces.
+What that comes down to: treat people with respect, criticise ideas rather than the people who have them, and assume good intent. Harassment and personal attacks have no place here.
 
-Enforcement contact: open a confidential report via GitHub's private reporting on this repository.
+To report a problem in confidence, use GitHub's private reporting on this repository.

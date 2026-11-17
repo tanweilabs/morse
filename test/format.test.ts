@@ -1,31 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { describeRelayStatus, formatDuration, formatRelativeTime, shortenHome } from '../src/format.js';
 
-describe('formatRelativeTime', () => {
-  const now = 1_000_000_000_000;
-  it('formats sub-minute as just now', () => {
-    expect(formatRelativeTime(now - 30_000, now)).toBe('just now');
+describe('formatRelativeTime: how long ago, coarsely', () => {
+  const at = Date.parse('2026-06-01T12:00:00Z');
+  const ago = (ms: number) => formatRelativeTime(at - ms, at);
+
+  it('under a minute — or in the future — is "just now"', () => {
+    expect([0, 1, 59_999, -3_600_000].map(ago)).toEqual(['just now', 'just now', 'just now', 'just now']);
   });
-  it('formats minutes', () => {
-    expect(formatRelativeTime(now - 5 * 60_000, now)).toBe('5m ago');
+
+  it('then whole minutes, hours and days, always rounded down', () => {
+    expect([60_000, 119_999, 59 * 60_000 + 59_999].map(ago)).toEqual(['1m ago', '1m ago', '59m ago']);
+    expect([3_600_000, 23 * 3_600_000 + 3_599_999].map(ago)).toEqual(['1h ago', '23h ago']);
+    expect([86_400_000, 36 * 3_600_000, 400 * 86_400_000].map(ago)).toEqual(['1d ago', '1d ago', '400d ago']);
   });
-  it('formats hours', () => {
-    expect(formatRelativeTime(now - 3 * 3_600_000, now)).toBe('3h ago');
-  });
-  it('formats days', () => {
-    expect(formatRelativeTime(now - 49 * 3_600_000, now)).toBe('2d ago');
-  });
-  it('clamps future timestamps', () => {
-    expect(formatRelativeTime(now + 60_000, now)).toBe('just now');
+
+  it('measures from now by default', () => {
+    expect(formatRelativeTime(Date.now() - 2 * 3_600_000 - 5000)).toBe('2h ago');
   });
 });
 
 describe('shortenHome', () => {
-  it('replaces home prefix with ~', () => {
-    expect(shortenHome('/home/u/proj', '/home/u')).toBe('~/proj');
+  it('writes a path under the home directory as ~/…, and the home itself as ~', () => {
+    expect(shortenHome('/Users/alex/code/app', '/Users/alex')).toBe('~/code/app');
+    expect(shortenHome('/Users/alex', '/Users/alex')).toBe('~');
   });
-  it('leaves other paths alone', () => {
-    expect(shortenHome('/tmp/x', '/home/u')).toBe('/tmp/x');
+  it('leaves any other path alone', () => {
+    expect(shortenHome('/opt/tool', '/Users/alex')).toBe('/opt/tool');
   });
 });
 

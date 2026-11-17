@@ -2,155 +2,170 @@ import type { DeliveryAdapter, SessionInfo } from '../adapters/types.js';
 import { routeForMessage } from '../cluster/routing.js';
 import type { Mailbox, Message } from '../mailbox/mailbox.js';
 
+/** What happened to one claimed message, reported through `onEvent`. */
 export interface DispatchEvent {
   kind: 'delivered' | 'failed' | 'waiting' | 'reply-filed' | 'reply-rejected' | 'redirected';
   message: Message;
   detail?: string;
 }
 
+/** What a transport reports after trying to hand a message to another device or person. */
+type RelayResult = { ok: boolean; error?: string; waiting?: boolean; terminal?: boolean; via?: string; request?: boolean };
+
 export interface DispatcherOptions {
   mailbox: Mailbox;
-  /** Unused by the core since ADR-052 (the dispatch plugin has them); kept so callers compile. */
+  /** No longer read by the core (ADR-052: own-agent delivery moved to the dispatch plugin); still accepted. */
   adapters?: Map<string, DeliveryAdapter>;
+  /** No longer read by the core (see `adapters`). */
   directory?: () => Promise<SessionInfo[]>;
   onEvent?: (event: DispatchEvent) => void;
-  /** This machine's device name; unset disables relay routing (Phase 1 mode). */
+  /** Name of this device. When unset every message is treated as local and nothing is relayed. */
   selfDevice?: string;
-  /** Hand a message to a paired peer daemon (Phase 2 LAN) or, through the Morse
-   *  relay, to a person (handle). `waiting` = not reachable right now; the message
-   *  stays in the outbox and is retried until it is (no dead-letter on count). */
-  relay?: (device: string, message: Message) => Promise<{ ok: boolean; error?: string; waiting?: boolean; terminal?: boolean; via?: string; request?: boolean }>;
-  /** A local session actively running `morse message --wait` receives messages live in its
-   *  own turn; the dispatcher must NOT resume-deliver to it (which would create an
-   *  invisible headless turn). Such messages stay pending for the monitor to pull. */
+  /**
+   * Transport to another device (paired LAN peer) or, via the Morse relay, to a person.
+   * `waiting` means "not reachable at the moment": the message stays queued and is tried again
+   * later with no retry ceiling. `terminal` means it can never be delivered.
+   */
+  relay?: (device: string, message: Message) => Promise<RelayResult>;
+  /** Not read by the core: a session following its own mail with `morse message --wait` (consumed by the dispatch plugin). */
   isMonitored?: (sessionId: string) => boolean;
-  /** A local Claude session open in an interactive process must also NOT be
-   *  resume-delivered to: the injected turn lands but `claude -p` exits non-zero
-   *  (a post-turn hook chokes, or the shared session errors), so Morse false-
-   *  fails and retries — re-injecting duplicate turns into the session the operator
-   *  is actively using. Leave it pending; its own prompt hook surfaces it (ADR-023).
-   *  Same for a Codex thread held open by Codex Desktop: resume is refused outright
-   *  ("already has an active writer"), so it too waits for its prompt hook (ADR-026). */
+  /**
+   * Not read by the core: a session that is open interactively (a Claude process, a Codex Desktop
+   * thread) and picks mail up through its prompt hook instead of a headless resume (ADR-023, ADR-026).
+   */
   isSessionLive?: (sessionId: string) => boolean;
-  /** A registered EXTERNAL agent session (ADR-024) — a desktop App's assistant
-   *  such as 闪电说, which Morse has no delivery adapter for. It pulls its own
-   *  mail over the daemon's HTTP inbox, so its messages must stay pending rather
-   *  than be claimed and dead-lettered for want of an adapter. */
+  /** Not read by the core: an external registered session (ADR-024) that fetches its mail over HTTP. */
   isPullOnly?: (sessionId: string) => boolean;
-  /** Local session ids that are ALWAYS pull-only (Morse 'inbox') — the mailbox filters
-   *  them in SQL so they never fill the claim window (ADR-044). */
+  /** Session ids that only ever pull (e.g. 'inbox'); excluded in the claim query so they cannot starve it (ADR-044). */
   pullOnlySessions?: string[];
 }
 
+/** How the core settles a claimed message. */
+type Outcome =
+  | { status: 'delivered'; detail: string }
+  | { status: 'failed'; error: string; terminal?: boolean }
+  | { status: 'waiting'; error: string };
+
+const REQUEST_PENDING = ' — request pending (in their message requests until they accept you)';
+
 /**
- * The core's half of delivery (ADR-052): claim the next OUTBOUND message — to another
- * device / person, or to the human's own inbox — and hand it to the transport. The
- * core never runs an agent: mail for a session on this computer is left for the
- * dispatch plugin (src/plugins/dispatch), which claims it through the plugin contract.
- * Returns false when nothing was due.
+ * Decide the outcome for a message bound for another device or person.
+ *
+ * Mail to the human ('user') is the operator's escalation channel (ADR-020) and must not be lost:
+ * whenever the relay is missing or fails (short of "never deliverable"), it is kept in this
+ * machine's inbox — shown in the local console — rather than failed.
+ */
+async function relayOutcome(message: Message, device: string, opts: DispatcherOptions): Promise<Outcome> {
+  const forHuman = message.to.agent === 'user';
+  const keepLocally = (why: string): Outcome => ({ status: 'delivered', detail: `user-inbox:${why}` });
+
+  if (opts.relay === undefined) {
+    if (forHuman) return keepLocally('relay-unconfigured');
+    return { status: 'failed', error: `target device "${device}" requires LAN relay (not configured)` };
+  }
+
+  let result: RelayResult;
+  try {
+    result = await opts.relay(device, message);
+  } catch (err) {
+    if (forHuman) return keepLocally('relay-error');
+    return { status: 'failed', error: err instanceof Error ? err.message : String(err) };
+  }
+
+  if (result.ok) {
+    // ADR-037: `request` = it reached the recipient's message requests; they have not accepted us yet.
+    const via = result.via ? ` via ${result.via}` : '';
+    return { status: 'delivered', detail: `relayed-to:${device}${via}${result.request ? REQUEST_PENDING : ''}` };
+  }
+  if (result.waiting) return { status: 'waiting', error: result.error ?? `${device} is not reachable right now` };
+  // ADR-091 follow-up: e.g. an old name that no longer resolves. Fail for good, never fall back locally.
+  if (result.terminal) return { status: 'failed', error: result.error ?? `${device} cannot be reached`, terminal: true };
+  if (forHuman) return keepLocally('relay-failed');
+  return { status: 'failed', error: result.error ?? `relay to ${device} failed` };
+}
+
+/** Outcome for a message that stays on this device. */
+function localOutcome(message: Message): Outcome {
+  // The human has no session to resume: the mailbox itself is their inbox (read in the console).
+  if (message.to.agent === 'user') return { status: 'delivered', detail: 'user-inbox' };
+  // The outbound claim never yields own-session mail; should it ever, hand it back as a plain failure.
+  return { status: 'failed', error: "not for the core: local session mail is the dispatch plugin's" };
+}
+
+/** Write the outcome to the mailbox and report it. */
+function settle(opts: DispatcherOptions, id: string, outcome: Outcome): void {
+  const { mailbox } = opts;
+  let event: DispatchEvent;
+  switch (outcome.status) {
+    case 'delivered':
+      event = { kind: 'delivered', message: mailbox.markDelivered(id), detail: outcome.detail };
+      break;
+    case 'waiting':
+      event = { kind: 'waiting', message: mailbox.markFailed(id, outcome.error, { waiting: true }), detail: outcome.error };
+      break;
+    case 'failed':
+      event = {
+        kind: 'failed',
+        message: mailbox.markFailed(id, outcome.error, outcome.terminal ? { terminal: true } : undefined),
+        detail: outcome.error,
+      };
+      break;
+  }
+  opts.onEvent?.(event);
+}
+
+/**
+ * One step of the core's delivery work (ADR-052). It claims the oldest due OUTBOUND message —
+ * one headed to another device or person, or to the human's own inbox — and passes it to the
+ * transport. Running an agent for a session on this computer is the dispatch plugin's job
+ * (src/plugins/dispatch), which claims such mail through the plugin contract.
+ * Resolves false when there was nothing to claim.
  */
 export async function dispatchOnce(opts: DispatcherOptions): Promise<boolean> {
-  const claimed = opts.mailbox.claimNextPending({
-    scope: 'outbound',
-    ...(opts.pullOnlySessions?.length ? { pullOnlySessions: opts.pullOnlySessions } : {}),
-  });
-  if (!claimed) return false;
-  const emit = (event: DispatchEvent) => opts.onEvent?.(event);
+  const pullOnly = opts.pullOnlySessions ?? [];
+  const message = opts.mailbox.claimNextPending(
+    pullOnly.length > 0 ? { scope: 'outbound', pullOnlySessions: pullOnly } : { scope: 'outbound' },
+  );
+  if (message === null) return false;
 
-  const fail = (error: string, terminal = false): true => {
-    const failed = opts.mailbox.markFailed(claimed.id, error, terminal ? { terminal: true } : undefined);
-    emit({ kind: 'failed', message: failed, detail: error });
-    return true;
-  };
-  const wait = (error: string): true => {
-    const failed = opts.mailbox.markFailed(claimed.id, error, { waiting: true });
-    emit({ kind: 'waiting', message: failed, detail: error });
-    return true;
-  };
-
-  // Route FIRST — even a reply to the human may be on another device (kimi on
-  // mini replying to the user on macbook must relay home, not sit in mini's
-  // local inbox). Only a LOCAL user reply is a mailbox-is-the-inbox delivery.
-  const route = routeForMessage(claimed, opts.selfDevice ?? '');
-  if (route.kind === 'relay') {
-    // A message to the human must never dead-letter — it is the operator's
-    // escalation channel (ADR-020: the self-driving loop asks the operator here
-    // when it stalls). Relay home when we can; if relay is unavailable or fails,
-    // fall back to THIS machine's inbox (visible in the local console) instead of
-    // losing it. Non-user targets keep the normal fail→retry→dead behaviour.
-    const toUser = claimed.to.agent === 'user';
-    const userSink = (detail: string): true => {
-      const delivered = opts.mailbox.markDelivered(claimed.id);
-      emit({ kind: 'delivered', message: delivered, detail });
-      return true;
-    };
-    if (!opts.relay) {
-      return toUser
-        ? userSink('user-inbox:relay-unconfigured')
-        : fail(`target device "${route.device}" requires LAN relay (not configured)`);
-    }
-    let relayed;
-    try {
-      relayed = await opts.relay(route.device, claimed);
-    } catch (e) {
-      return toUser ? userSink('user-inbox:relay-error') : fail(e instanceof Error ? e.message : String(e));
-    }
-    if (!relayed.ok) {
-      if (relayed.waiting) return wait(relayed.error ?? `${route.device} is not reachable right now`);
-      // (ADR-091 follow-up) it can never go (an old name): a failure for good — not "delivered" to the local inbox
-      if (relayed.terminal) return fail(relayed.error ?? `${route.device} cannot be reached`, true);
-      return toUser ? userSink('user-inbox:relay-failed') : fail(relayed.error ?? `relay to ${route.device} failed`);
-    }
-    const delivered = opts.mailbox.markDelivered(claimed.id);
-    emit({
-      kind: 'delivered',
-      message: delivered,
-      // ADR-037: it reached their message requests, not their inbox — they have not accepted you yet
-      detail: `relayed-to:${route.device}${relayed.via ? ` via ${relayed.via}` : ''}${relayed.request ? ' — request pending (in their message requests until they accept you)' : ''}`,
-    });
-    return true;
-  }
-
-  // Local: a reply addressed to the human has no session to resume — landing in this
-  // machine's mailbox IS the delivery (read in the console). Nothing else local is claimed.
-  if (claimed.to.agent === 'user') {
-    const delivered = opts.mailbox.markDelivered(claimed.id);
-    emit({ kind: 'delivered', message: delivered, detail: 'user-inbox' });
-    return true;
-  }
-  // scope 'outbound' never hands out other local mail; put it back untouched if it ever does
-  return fail('not for the core: local session mail is the dispatch plugin\'s');
+  // Routing comes first even for the human: a reply to someone on another device must travel there.
+  const route = routeForMessage(message, opts.selfDevice ?? '');
+  const outcome = route.kind === 'relay' ? await relayOutcome(message, route.device, opts) : localOutcome(message);
+  settle(opts, message.id, outcome);
+  return true;
 }
+
 export interface RunningDispatcher {
   stop(): void;
 }
 
-/** Poll the mailbox forever; drains the queue then idles at intervalMs. */
-export function startDispatcher(
-  opts: DispatcherOptions,
-  { intervalMs = 1000 }: { intervalMs?: number } = {},
-): RunningDispatcher {
-  let stopped = false;
-  let timer: NodeJS.Timeout | null = null;
+/**
+ * Keep dispatching until stopped: drain everything that is due, then sleep `intervalMs`
+ * before looking again. Errors never end the loop (failures are already recorded per message).
+ */
+export function startDispatcher(opts: DispatcherOptions, { intervalMs = 1000 }: { intervalMs?: number } = {}): RunningDispatcher {
+  let active = true;
+  let sleeper: NodeJS.Timeout | undefined;
 
-  const tick = async (): Promise<void> => {
-    if (stopped) return;
+  const drain = async (): Promise<void> => {
     try {
-      // drain everything currently pending before going back to sleep
-      while (!stopped && (await dispatchOnce(opts))) {
-        /* keep draining */
-      }
+      let more = true;
+      while (active && more) more = await dispatchOnce(opts);
     } catch {
-      // dispatchOnce already records failures; never let the loop die
+      // swallow: the next round tries again
     }
-    if (!stopped) timer = setTimeout(() => void tick(), intervalMs);
+  };
+  const round = (): void => {
+    void drain().then(() => {
+      if (active) sleeper = setTimeout(round, intervalMs);
+    });
   };
 
-  void tick();
+  round();
   return {
     stop() {
-      stopped = true;
-      if (timer) clearTimeout(timer);
+      active = false;
+      clearTimeout(sleeper);
     },
   };
 }

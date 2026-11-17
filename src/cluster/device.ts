@@ -3,23 +3,26 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { morseHome, dataDir } from '../home.js';
 
-const DEVICE_FILE = 'device-name';
+/** ~/.morse/device-name: one line, the name this computer goes by. */
+const nameFile = (home: string): string => join(dataDir(home), 'device-name');
 
-/** Stable device name: explicit file wins, else hostname's first label. */
+/**
+ * This computer's name. A name stored in ~/.morse/device-name wins; without one, the first label
+ * of the host name (lower case) is used — and stored, because macOS renames hosts on its own (a
+ * LAN name clash adds "-2") and the name must not change under the user.
+ */
 export function getDeviceName(home: string = morseHome()): string {
-  const path = join(dataDir(home), DEVICE_FILE);
-  if (existsSync(path)) {
-    const name = readFileSync(path, 'utf8').trim();
-    if (name) return name;
-  }
-  // Persist the first derivation: macOS hostnames drift (LAN name-conflict
-  // suffixes), and the device name is the cluster routing identity.
-  const derived = (hostname().split('.')[0] ?? 'device').toLowerCase();
+  const file = nameFile(home);
+  const stored = existsSync(file) ? readFileSync(file, 'utf8').trim() : '';
+  if (stored) return stored;
+  const [firstLabel = 'device'] = hostname().split('.');
+  const derived = firstLabel.toLowerCase();
   setDeviceName(derived, home);
   return derived;
 }
 
+/** Store the name (trimmed) for later calls of getDeviceName. */
 export function setDeviceName(name: string, home: string = morseHome()): void {
   mkdirSync(dataDir(home), { recursive: true });
-  writeFileSync(join(dataDir(home), DEVICE_FILE), `${name.trim()}\n`, 'utf8');
+  writeFileSync(nameFile(home), `${name.trim()}\n`, 'utf8');
 }

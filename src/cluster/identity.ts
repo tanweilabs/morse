@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, randomBytes, sign, X509Certificate } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign, X509Certificate, type KeyObject } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock, writeFileAtomic } from '../file-lock.js';
@@ -6,164 +6,179 @@ import { morseHome, dataDir } from '../home.js';
 import { protectDataDir } from '../platform/acl.js';
 
 /**
- * Device identity, Syncthing-style (ADR-028): every device owns an Ed25519 key and
- * a self-signed certificate; its device ID is the SHA-256 of that certificate.
- * The ID is public — pairing exchanges IDs, never secrets — and only the holder of
- * the private key can present a certificate with that fingerprint.
+ * The key this computer holds (ADR-028), kept under ~/.morse/identity/ as key.pem + cert.pem.
  *
- * Node can make the key but not the certificate, so the (fixed-shape, extension-
- * free) DER is encoded here: zero dependencies, verified with X509Certificate.
+ * The private key is Ed25519. Next to it sits a self-signed X.509 certificate for that key, and the
+ * device ID is a fingerprint of the certificate (base32 of its SHA-256). Handing out the ID reveals
+ * nothing; presenting a certificate that hashes to it needs the private key.
+ *
+ * Node's crypto can generate the key pair but cannot issue a certificate, so the certificate is
+ * assembled here as raw DER. Its layout never varies (no extensions, CN "anytoany" as both subject
+ * and issuer, open-ended validity), which keeps the encoder to a handful of tag/length helpers.
  */
 
 export interface DeviceIdentity {
-  /** Formatted device ID, e.g. ABCDEFG-HIJKLMN-…-XYZ */
+  /** The device ID in its printed form: 52 base32 characters in dash-separated groups of seven. */
   id: string;
   certPem: string;
   keyPem: string;
 }
 
-const ED25519_OID = [1, 3, 101, 112];
-const CN_OID = [2, 5, 4, 3];
-// Compatibility: the certificate's subject / issuer name is shown to every peer and is part
-// of what the device ID hashes; identities keep the shape older releases created (ADR-075).
-const COMMON_NAME = 'anytoany';
-const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-const ID_LENGTH = 52; // 256 bits / 5 bits per char, rounded up
-const ID_GROUP = 7;
+/** Characters per group in a printed device ID, and so also the length of the short form. */
+const GROUP = 7;
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+/** A bare ID: the 256-bit fingerprint in base32, the last character padded with zero bits. */
+const BARE_ID = /^[A-Z2-7]{52}$/;
 
-// --- minimal DER ------------------------------------------------------------
+// ---- DER building blocks -------------------------------------------------------------------------
 
-function derLength(n: number): Buffer {
-  if (n < 0x80) return Buffer.from([n]);
-  const bytes: number[] = [];
-  for (let v = n; v > 0; v >>= 8) bytes.unshift(v & 0xff);
-  return Buffer.from([0x80 | bytes.length, ...bytes]);
-}
-
-const tlv = (tag: number, body: Buffer): Buffer => Buffer.concat([Buffer.from([tag]), derLength(body.length), body]);
-const seq = (...parts: Buffer[]): Buffer => tlv(0x30, Buffer.concat(parts));
-const set = (...parts: Buffer[]): Buffer => tlv(0x31, Buffer.concat(parts));
-
-function oid(arcs: number[]): Buffer {
-  const [first = 0, second = 0, ...rest] = arcs;
-  const bytes = [first * 40 + second];
-  for (const arc of rest) {
-    const chunk: number[] = [];
-    for (let v = arc; ; v = Math.floor(v / 128)) {
-      chunk.unshift((v % 128) | (chunk.length ? 0x80 : 0));
-      if (v < 128) break;
-    }
-    bytes.push(...chunk);
+/** Tag + definite length + content. */
+function element(tag: number, ...content: Buffer[]): Buffer {
+  const body = Buffer.concat(content);
+  let length: Buffer;
+  if (body.length < 0x80) {
+    length = Buffer.of(body.length);
+  } else {
+    const digits: number[] = [];
+    for (let rest = body.length; rest > 0; rest = Math.floor(rest / 256)) digits.push(rest % 256);
+    length = Buffer.of(0x80 + digits.length, ...digits.reverse());
   }
-  return tlv(0x06, Buffer.from(bytes));
+  return Buffer.concat([Buffer.of(tag), length, body]);
 }
+
+const SEQUENCE = 0x30;
+const SET = 0x31;
 
 /**
- * Positive INTEGER in canonical DER: no redundant leading 0x00 (strict parsers —
- * OpenSSL 3.0 / Node 20 — reject "illegal padding"), and a single 0x00 only when
- * the high bit would otherwise make it negative.
+ * A non-negative INTEGER in its one canonical DER form. Strict decoders (OpenSSL 3 under Node 20)
+ * refuse superfluous leading zero bytes, so they are dropped first; a single zero is put back only
+ * when the top bit of what remains is set, since that bit would otherwise read as a minus sign.
  */
 export function derInteger(bytes: Buffer): Buffer {
-  let start = 0;
-  while (start < bytes.length - 1 && bytes[start] === 0 && (bytes[start + 1]! & 0x80) === 0) start++;
-  const body = bytes.subarray(start);
-  return tlv(0x02, body[0]! & 0x80 ? Buffer.concat([Buffer.from([0]), body]) : body);
-}
-const integer = derInteger;
-
-const name = (cn: string): Buffer => seq(set(seq(oid(CN_OID), tlv(0x0c, Buffer.from(cn, 'utf8')))));
-
-function utcTime(d: Date): Buffer {
-  const p = (n: number) => String(n).padStart(2, '0');
-  const s = `${p(d.getUTCFullYear() % 100)}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z`;
-  return tlv(0x17, Buffer.from(s, 'ascii'));
+  let first = bytes.findIndex((b) => b !== 0);
+  if (first === -1) first = Math.max(0, bytes.length - 1);
+  const magnitude = bytes.subarray(first);
+  const needsPad = magnitude.length > 0 && magnitude[0]! >= 0x80;
+  return element(0x02, needsPad ? Buffer.of(0) : Buffer.alloc(0), magnitude);
 }
 
-/** RFC 5280 §4.1.2.5: 99991231235959Z means "no well-defined expiration". */
-const NO_EXPIRY = tlv(0x18, Buffer.from('99991231235959Z', 'ascii'));
+/** AlgorithmIdentifier for Ed25519 (OID 1.3.101.112, no parameters). */
+const ED25519_ALGORITHM = element(SEQUENCE, Buffer.from('06032b6570', 'hex'));
+/** OID 2.5.4.3, commonName. */
+const COMMON_NAME_OID = Buffer.from('0603550403', 'hex');
+/**
+ * Compatibility: what the certificate names as its subject and issuer. It is part of the hashed
+ * bytes and visible to whoever reads the certificate; new identities keep the form older releases
+ * wrote (ADR-075).
+ */
+const CERT_NAME = 'anytoany';
+/** Distinguished name with one attribute: CN as a UTF8String. */
+const DISTINGUISHED_NAME = element(SEQUENCE, element(SET, element(SEQUENCE, COMMON_NAME_OID, element(0x0c, Buffer.from(CERT_NAME, 'utf8')))));
+/** GeneralizedTime 99991231235959Z: RFC 5280's way of saying the certificate never expires. */
+const NEVER_EXPIRES = element(0x18, Buffer.from('99991231235959Z', 'ascii'));
 
-// --- identity ------------------------------------------------------------------
+/** UTCTime, YYMMDDHHMMSSZ. */
+function utcTime(at: Date): Buffer {
+  const digits = at.toISOString().slice(2, 19).replace(/[-T:]/g, '');
+  return element(0x17, Buffer.from(`${digits}Z`, 'ascii'));
+}
 
-/** A fresh key pair and a self-signed certificate for it. */
-export function createSelfSignedIdentity(now: Date = new Date()): { certPem: string; keyPem: string } {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const algorithm = seq(oid(ED25519_OID));
-  const serial = randomBytes(16);
-  serial[0] = (serial[0]! & 0x7f) | 0x01; // positive and non-zero leading byte → 16 canonical bytes
-  // backdate a day so a peer with a slightly slow clock still accepts it
-  const notBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const tbs = seq(
-    tlv(0xa0, integer(Buffer.from([2]))), // [0] version v3
-    integer(serial),
-    algorithm,
-    name(COMMON_NAME),
-    seq(utcTime(notBefore), NO_EXPIRY),
-    name(COMMON_NAME),
-    publicKey.export({ type: 'spki', format: 'der' }),
+const ONE_DAY_MS = 86_400_000;
+
+/** The DER certificate for `privateKey`, self-signed. */
+function issueCertificate(privateKey: KeyObject, publicKey: KeyObject, serial: Buffer, issuedAt: Date): Buffer {
+  // valid from a day before issue, so a peer whose clock runs a little behind still accepts it
+  const validity = element(SEQUENCE, utcTime(new Date(issuedAt.getTime() - ONE_DAY_MS)), NEVER_EXPIRES);
+  const toBeSigned = element(
+    SEQUENCE,
+    element(0xa0, derInteger(Buffer.of(2))), // explicit [0]: version 3
+    derInteger(serial),
+    ED25519_ALGORITHM,
+    DISTINGUISHED_NAME, // issuer
+    validity,
+    DISTINGUISHED_NAME, // subject
+    publicKey.export({ format: 'der', type: 'spki' }),
   );
-  const signature = sign(null, tbs, privateKey);
-  const der = seq(tbs, algorithm, tlv(0x03, Buffer.concat([Buffer.from([0]), signature])));
-  const body = der.toString('base64').match(/.{1,64}/g)?.join('\n') ?? '';
+  const signatureBits = element(0x03, Buffer.of(0), sign(null, toBeSigned, privateKey)); // 0 unused bits
+  return element(SEQUENCE, toBeSigned, ED25519_ALGORITHM, signatureBits);
+}
+
+function pem(label: string, der: Buffer): string {
+  const lines = der.toString('base64').match(/[\s\S]{1,64}/g) ?? [];
+  return [`-----BEGIN ${label}-----`, ...lines, `-----END ${label}-----`, ''].join('\n');
+}
+
+/** A new Ed25519 key with its self-signed certificate, both as PEM. */
+export function createSelfSignedIdentity(now: Date = new Date()): { certPem: string; keyPem: string } {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  // 16 random bytes; the first is forced into 0x01..0x7f so the INTEGER is positive and exactly 16 bytes long
+  const serial = randomBytes(16);
+  serial.writeUInt8((serial.readUInt8(0) & 0x7e) | 0x01, 0);
   return {
-    certPem: `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`,
-    keyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    certPem: pem('CERTIFICATE', issueCertificate(privateKey, publicKey, serial, now)),
+    keyPem: privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
   };
 }
 
-function base32(bytes: Buffer): string {
-  let bits = 0;
-  let value = 0;
-  let out = '';
-  for (const byte of bytes) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      out += BASE32[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
+// ---- device IDs ---------------------------------------------------------------------------------
+
+/** RFC 4648 base32 without padding characters; a final partial group is filled with zero bits. */
+function toBase32(bytes: Buffer): string {
+  if (bytes.length === 0) return '';
+  const bitCount = bytes.length * 8;
+  const chars = Math.ceil(bitCount / 5);
+  let n = BigInt(`0x${bytes.toString('hex')}`) << BigInt(chars * 5 - bitCount);
+  const out: string[] = [];
+  for (let i = 0; i < chars; i++) {
+    out.push(BASE32_ALPHABET[Number(n & 31n)]!);
+    n >>= 5n;
   }
-  if (bits > 0) out += BASE32[(value << (5 - bits)) & 31];
-  return out;
+  return out.reverse().join('');
 }
 
-/** Group a bare 52-char ID as XXXXXXX-XXXXXXX-…-XXX. */
+/** Insert the dashes: a bare 52-character ID becomes XXXXXXX-XXXXXXX-…-XXX. */
 export function formatDeviceId(bare: string): string {
-  return bare.match(new RegExp(`.{1,${ID_GROUP}}`, 'g'))?.join('-') ?? bare;
+  const groups: string[] = [];
+  for (let at = 0; at < bare.length; at += GROUP) groups.push(bare.slice(at, at + GROUP));
+  return groups.length ? groups.join('-') : bare;
 }
 
-/** The device ID a certificate (DER) stands for. */
+/** The device ID that a DER certificate stands for. */
 export function deviceIdFromCert(der: Buffer): string {
-  return formatDeviceId(base32(createHash('sha256').update(der).digest()));
+  return formatDeviceId(toBase32(createHash('sha256').update(der).digest()));
 }
 
-/** Accept what a human pastes — any case, spaces, dashes. null = not a device ID. */
+/** Read a device ID as people paste it (lower case, spaces, dashes in odd places); null when it is not one. */
 export function normalizeDeviceId(input: string): string | null {
-  const bare = input.toUpperCase().replace(/[\s-]/g, '');
-  if (bare.length !== ID_LENGTH || ![...bare].every((c) => BASE32.includes(c))) return null;
-  return formatDeviceId(bare);
+  const bare = input.replace(/[\s-]+/g, '').toUpperCase();
+  return BARE_ID.test(bare) ? formatDeviceId(bare) : null;
 }
 
-export const shortDeviceId = (id: string): string => id.slice(0, ID_GROUP);
+/** The first group of an ID — enough to tell devices apart in a listing. */
+export const shortDeviceId = (id: string): string => id.slice(0, GROUP);
 
-/** This device's identity, created on first use under ~/.morse/identity/. */
+// ---- this computer's identity -------------------------------------------------------------------
+
+/** This computer's identity, generated the first time it is asked for. */
 export function loadOrCreateIdentity(home: string = morseHome()): DeviceIdentity {
   const dir = join(dataDir(home), 'identity');
-  const certPath = join(dir, 'cert.pem');
-  const keyPath = join(dir, 'key.pem');
-  if (!existsSync(certPath) || !existsSync(keyPath)) {
-    // under a lock, and checked again inside it: two morse processes starting on a fresh
-    // home at once would otherwise each create an identity and leave one's key with the other's certificate
+  const files = { cert: join(dir, 'cert.pem'), key: join(dir, 'key.pem') };
+  const complete = () => existsSync(files.cert) && existsSync(files.key);
+  if (!complete()) {
+    // Two morse processes may start on an empty home together. Generating under the lock, and looking
+    // again once it is held, stops them pairing one process's key with the other's certificate.
     withFileLock(dir, () => {
-      if (existsSync(certPath) && existsSync(keyPath)) return;
+      if (complete()) return;
       const fresh = createSelfSignedIdentity();
-      protectDataDir(dataDir(home)); // Windows: an ACL instead of the modes below; throws rather than write a key others can read (ADR-080)
+      // Windows gets an ACL in place of the POSIX modes below — and an error rather than a key others could read (ADR-080)
+      protectDataDir(dataDir(home));
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      chmodSync(dir, 0o700); // mkdir's mode is masked by umask
-      writeFileAtomic(keyPath, fresh.keyPem, { mode: 0o600 });
-      writeFileAtomic(certPath, fresh.certPem, { mode: 0o644 });
+      chmodSync(dir, 0o700); // the umask may have narrowed mkdir's mode; set it outright
+      writeFileAtomic(files.key, fresh.keyPem, { mode: 0o600 });
+      writeFileAtomic(files.cert, fresh.certPem, { mode: 0o644 });
     });
   }
-  const certPem = readFileSync(certPath, 'utf8');
-  const keyPem = readFileSync(keyPath, 'utf8');
+  const certPem = readFileSync(files.cert, 'utf8');
+  const keyPem = readFileSync(files.key, 'utf8');
   return { id: deviceIdFromCert(new X509Certificate(certPem).raw), certPem, keyPem };
 }

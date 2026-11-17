@@ -1,153 +1,286 @@
 import Database from 'better-sqlite3';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { createZcodeAdapter } from '../src/adapters/zcode.js';
-import type { ExecFn } from '../src/adapters/types.js';
+import type { SessionInfo } from '../src/adapters/types.js';
+import { recordingExec } from './helpers/fake-exec.js';
 
-const dir = mkdtempSync(join(tmpdir(), 'anytoany-zcode-'));
-afterAll(() => rmSync(dir, { recursive: true, force: true }));
+const work = mkdtempSync(join(tmpdir(), 'morse-zcode-'));
+afterAll(() => rmSync(work, { recursive: true, force: true }));
+afterEach(() => vi.unstubAllEnvs());
 
-const SESS = {
-  agent: 'zcode',
-  sessionId: 'sess_11111111-2222-4333-8444-555555555555',
-  title: 'api service audit',
-  cwd: '/w/api-service',
-  lastActiveAt: 5000,
+const SID = 'sess_7f3a9c10-0b1d-4e2f-9a8b-1c2d3e4f5a6b';
+const target: SessionInfo = { agent: 'zcode', sessionId: SID, title: 'audit', cwd: '/srv/audit', lastActiveAt: 0 };
+const NO_DB = join(work, 'no-db.sqlite');
+const NO_CONFIG = join(work, 'no-config.json');
+let fileNo = 0;
+const config = (zcode: Record<string, unknown>): string => {
+  const file = join(work, `config-${++fileNo}.json`);
+  writeFileSync(file, JSON.stringify({ zcode }));
+  return file;
 };
 
-function makeDb(name: string): string {
-  const path = join(dir, name);
-  const db = new Database(path);
-  db.exec(`CREATE TABLE session (
-    id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, title TEXT,
-    directory TEXT, task_type TEXT, time_created INTEGER, time_updated INTEGER
-  )`);
-  const ins = db.prepare(
-    'INSERT INTO session (id, parent_id, title, directory, task_type, time_created, time_updated) VALUES (?,?,?,?,?,?,?)',
-  );
-  ins.run(SESS.sessionId, null, SESS.title, SESS.cwd, 'interactive', 1000, 5000);
-  ins.run('sess_aaaa0000-0000-4000-8000-000000000002', null, null, '/w/webapp', 'interactive', 1000, 9000);
-  ins.run('sess_subagent_agent_x1', null, 'a sub agent', '/w/x', 'interactive', 0, 8);
-  ins.run('sess_bbbb0000-0000-4000-8000-000000000003', SESS.sessionId, 'child of main', '/w/x', 'interactive', 0, 9);
-  ins.run('sess_cccc0000-0000-4000-8000-000000000004', null, 'typed subagent', '/w/x', 'subagent_child', 0, 10);
-  db.close();
-  return path;
-}
+describe('zcode: sessions are read from ZCode\'s own sqlite db', () => {
+  function dbOf(rows: Array<Record<string, unknown>>, schema = 'id TEXT, parent_id TEXT, title TEXT, directory TEXT, task_type TEXT, time_updated INTEGER, extra TEXT'): string {
+    const file = join(work, `db-${++fileNo}.sqlite`);
+    const db = new Database(file);
+    db.exec(`CREATE TABLE session (${schema})`);
+    for (const row of rows) {
+      const cols = Object.keys(row);
+      db.prepare(`INSERT INTO session (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...Object.values(row));
+    }
+    db.close();
+    return file;
+  }
+  const list = (dbFile: string) => createZcodeAdapter({ dbFile, engineBin: '/x/zcode', exec: recordingExec().exec }).listSessions();
 
-describe('zcode session discovery', () => {
-  it('lists interactive sessions, filters all three subagent shapes, maps fields', async () => {
-    const a = createZcodeAdapter({ dbFile: makeDb('db.sqlite'), engineBin: '/x/zcode.cjs' });
-    const sessions = await a.listSessions();
-    expect(sessions.map((s) => s.sessionId).sort()).toEqual(
-      ['sess_aaaa0000-0000-4000-8000-000000000002', SESS.sessionId].sort(),
-    );
-    const main = sessions.find((s) => s.sessionId === SESS.sessionId);
-    expect(main).toMatchObject({ agent: 'zcode', title: SESS.title, cwd: SESS.cwd, lastActiveAt: 5000 });
-    // null title falls back to the directory basename
-    const other = sessions.find((s) => s.sessionId.startsWith('sess_aaaa'));
-    expect(other?.title).toBe('webapp');
-    // newest first
-    expect(sessions[0]?.sessionId).toBe('sess_aaaa0000-0000-4000-8000-000000000002');
+  it('lists top-level sessions newest first, with title, directory and update time', async () => {
+    const file = dbOf([
+      { id: 'sess_older', title: ' Billing fix ', directory: '/w/billing', task_type: 'interactive', time_updated: 100 },
+      { id: 'sess_newer', title: null, directory: '/w/frontend', task_type: 'interactive', time_updated: 900 },
+      { id: 'sess_blank', title: '   ', directory: '', time_updated: 'not a number' },
+    ]);
+    expect(await list(file)).toEqual([
+      { agent: 'zcode', sessionId: 'sess_newer', title: 'frontend', cwd: '/w/frontend', lastActiveAt: 900 },
+      { agent: 'zcode', sessionId: 'sess_older', title: 'Billing fix', cwd: '/w/billing', lastActiveAt: 100 },
+      { agent: 'zcode', sessionId: 'sess_blank', title: 'untitled', cwd: '', lastActiveAt: 0 },
+    ]);
   });
 
-  it('returns [] when the db does not exist (machine without ZCode)', async () => {
-    const a = createZcodeAdapter({ dbFile: join(dir, 'nope', 'db.sqlite'), engineBin: '/x/zcode.cjs' });
-    expect(await a.listSessions()).toEqual([]);
-  });
-});
-
-describe('zcode delivery', () => {
-  const okExec: ExecFn = async () => ({ stdout: 'reply text', stderr: '', code: 0 });
-
-  it('resumes via node with explicit non-yolo mode and the exact session id', async () => {
-    const exec = vi.fn(okExec);
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/apps/zcode.cjs', exec, configFile: join(dir, 'no-config.json') });
-    const r = await a.deliver(SESS, 'ENVELOPE TEXT');
-    expect(r).toEqual({ ok: true, output: 'reply text' });
-    expect(exec).toHaveBeenCalledWith(
-      'node',
-      ['/apps/zcode.cjs', '--cwd', SESS.cwd, '--resume', SESS.sessionId, '--mode', 'build', '--prompt', 'ENVELOPE TEXT'],
-      { cwd: SESS.cwd, timeoutMs: 300_000 },
-    );
-    // headless --prompt defaults to yolo (skips permission gates) — we must never send it
-    expect((exec.mock.calls[0]?.[1] ?? []).join(' ')).not.toContain('yolo');
+  it('sub-agent sessions in any of their three shapes, and rows without an id, are left out', async () => {
+    const file = dbOf([
+      { id: 'sess_main', title: 'main', directory: '/w', time_updated: 5 },
+      { id: 'sess_subagent_reviewer_1', title: 'by name', directory: '/w', time_updated: 6 },
+      { id: 'sess_child', parent_id: 'sess_main', title: 'by parent', directory: '/w', time_updated: 7 },
+      { id: 'sess_typed', title: 'by type', directory: '/w', task_type: 'subagent_child', time_updated: 8 },
+      { id: 'sess_emptyparent', parent_id: '', title: 'empty parent is fine', directory: '/w', time_updated: 4 },
+      { id: '', title: 'no id', directory: '/w', time_updated: 9 },
+      { id: null, title: 'null id', directory: '/w', time_updated: 9 },
+    ]);
+    expect((await list(file)).map((s) => s.sessionId)).toEqual(['sess_main', 'sess_emptyparent']);
   });
 
-  it('runs a native binary directly and omits --cwd when unknown', async () => {
-    const exec = vi.fn(okExec);
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/usr/local/bin/zcode', exec, configFile: join(dir, 'no-config.json') });
-    await a.deliver({ ...SESS, cwd: '' }, 'E');
-    expect(exec).toHaveBeenCalledWith(
-      '/usr/local/bin/zcode',
-      ['--resume', SESS.sessionId, '--mode', 'build', '--prompt', 'E'],
-      { timeoutMs: 300_000 },
-    );
+  it('long titles are cut at 80 characters with an ellipsis', async () => {
+    const file = dbOf([{ id: 'sess_long', title: 't'.repeat(100), directory: '/w', time_updated: 1 }]);
+    expect((await list(file))[0]?.title).toBe(`${'t'.repeat(80)}…`);
   });
 
-  it('surfaces the tail of stderr on failure', async () => {
-    const exec: ExecFn = async () => ({ stdout: '', stderr: `${'x'.repeat(600)}REAL ERROR AT END`, code: 1 });
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/apps/zcode.cjs', exec, configFile: join(dir, 'no-config.json') });
-    const r = await a.deliver(SESS, 'E');
-    expect(r.ok).toBe(false);
-    expect(r.error).toContain('REAL ERROR AT END');
-    expect(r.error).toContain('exited 1');
+  it('no db, or a db without a session table: no sessions', async () => {
+    expect(await list(NO_DB)).toEqual([]);
+    const other = join(work, 'other.sqlite');
+    new Database(other).exec('CREATE TABLE unrelated (x TEXT)');
+    expect(await list(other)).toEqual([]);
   });
 });
 
-describe('per-machine delivery mode escalation', () => {
-  const okExec: ExecFn = async () => ({ stdout: 'ok', stderr: '', code: 0 });
-  const modeOf = (calls: Array<[string, string[], unknown]>) => {
-    const args = calls[0]?.[1] ?? [];
-    return args[args.indexOf('--mode') + 1];
+describe('zcode: headless delivery resumes the session in an explicit mode', () => {
+  const adapter = (opts: { engineBin?: string; configFile?: string; stdout?: string } = {}) => {
+    const rec = recordingExec({ stdout: opts.stdout ?? 'answer' });
+    const a = createZcodeAdapter({
+      dbFile: NO_DB,
+      exec: rec.exec,
+      configFile: opts.configFile ?? NO_CONFIG,
+      ...(opts.engineBin === undefined ? { engineBin: '/opt/zcode/bin/zcode' } : opts.engineBin ? { engineBin: opts.engineBin } : {}),
+    });
+    return { a, runs: rec.runs };
+  };
+  const modeIn = (args: string[]) => args[args.indexOf('--mode') + 1];
+
+  it('a native engine runs directly: --cwd, --resume, --mode build, --prompt', async () => {
+    const { a, runs } = adapter();
+    expect(await a.deliver(target, 'PROMPT; rm -rf /')).toEqual({ ok: true, output: 'answer' });
+    expect(runs).toEqual([
+      {
+        cmd: '/opt/zcode/bin/zcode',
+        args: ['--cwd', '/srv/audit', '--resume', SID, '--mode', 'build', '--prompt', 'PROMPT; rm -rf /'],
+        opts: { cwd: '/srv/audit', timeoutMs: 300_000 },
+      },
+    ]);
+  });
+
+  it.each(['/Applications/ZCode.app/glm/zcode.cjs', '/opt/zcode/engine.js'])('a script engine (%s) runs through node', async (engine) => {
+    const { a, runs } = adapter({ engineBin: engine });
+    await a.deliver(target, 'E');
+    expect(runs[0]?.cmd).toBe('node');
+    expect(runs[0]?.args.slice(0, 3)).toEqual([engine, '--cwd', '/srv/audit']);
+  });
+
+  it('an unknown cwd: no --cwd and no cwd option', async () => {
+    const { a, runs } = adapter();
+    await a.deliver({ ...target, cwd: '' }, 'E');
+    expect(runs[0]?.args).toEqual(['--resume', SID, '--mode', 'build', '--prompt', 'E']);
+    expect(runs[0]?.opts).toStrictEqual({ timeoutMs: 300_000 });
+  });
+
+  it('the mode is the owner\'s choice from config; anything unknown falls back to build', async () => {
+    const modes: Array<string | undefined> = [];
+    for (const deliverMode of ['yolo', 'plan', 'edit', 'build', 'sudo', 7]) {
+      const { a, runs } = adapter({ configFile: config({ deliverMode }) });
+      await a.deliver(target, 'E');
+      modes.push(modeIn(runs[0]!.args));
+    }
+    expect(modes).toEqual(['yolo', 'plan', 'edit', 'build', 'build', 'build']);
+  });
+
+  it('by default the headless engine never gets yolo', async () => {
+    const { a, runs } = adapter();
+    await a.deliver(target, 'E');
+    expect(runs[0]?.args.join(' ')).not.toContain('yolo');
+  });
+
+  it('deliverTimeoutSec counts within 60..3600 seconds; the adapter\'s own limit wins', async () => {
+    const seen: number[] = [];
+    for (const deliverTimeoutSec of [900, 60, 3600, 30, 4000]) {
+      const { a, runs } = adapter({ configFile: config({ deliverTimeoutSec }) });
+      await a.deliver(target, 'E');
+      seen.push(runs[0]!.opts.timeoutMs);
+    }
+    expect(seen).toEqual([900_000, 60_000, 3_600_000, 300_000, 300_000]);
+    const rec = recordingExec();
+    await createZcodeAdapter({ dbFile: NO_DB, exec: rec.exec, engineBin: '/z', configFile: config({ deliverTimeoutSec: 900 }), deliverTimeoutMs: 5_000 }).deliver(target, 'E');
+    expect(rec.runs[0]?.opts.timeoutMs).toBe(5_000);
+  });
+
+  it('a failure reports the exit code and the end of stderr', async () => {
+    const stderr = `${'='.repeat(900)}FATAL: session locked`;
+    const rec = recordingExec({ code: 1, stderr });
+    const result = await createZcodeAdapter({ dbFile: NO_DB, exec: rec.exec, engineBin: '/z', configFile: NO_CONFIG }).deliver(target, 'E');
+    expect(result).toEqual({ ok: false, error: `zcode resume exited 1: …${stderr.slice(-500)}` });
+  });
+
+  it('the engine is found through MORSE_ZCODE_BIN, then the old ANYTOANY_ZCODE_BIN, then PATH', async () => {
+    const bins = join(work, 'bins');
+    mkdirSync(bins, { recursive: true });
+    for (const f of ['custom-zcode', 'legacy-zcode', 'zcode']) writeFileSync(join(bins, f), '');
+    vi.stubEnv('PATH', bins);
+    const rec = recordingExec();
+    const a = createZcodeAdapter({ dbFile: NO_DB, exec: rec.exec, configFile: NO_CONFIG });
+    vi.stubEnv('MORSE_ZCODE_BIN', join(bins, 'custom-zcode'));
+    vi.stubEnv('ANYTOANY_ZCODE_BIN', join(bins, 'legacy-zcode'));
+    await a.deliver(target, 'E');
+    vi.stubEnv('MORSE_ZCODE_BIN', '');
+    await a.deliver(target, 'E');
+    vi.stubEnv('ANYTOANY_ZCODE_BIN', '');
+    await a.deliver(target, 'E');
+    expect(rec.runs.map((r) => r.cmd)).toEqual([join(bins, 'custom-zcode'), join(bins, 'legacy-zcode'), join(bins, 'zcode')]);
+  });
+});
+
+describe('zcode: a session mid-turn with its mailbox on gets the letter in its mailbox (ADR-029)', () => {
+  /** A mailbox root (optionally already enabled for SID) and an adapter whose polling we drive. */
+  function rig(opts: { enabled?: boolean; busy: () => boolean; onPoll?: (unread: string) => void; deliverTimeoutMs?: number }) {
+    const root = mkdtempSync(join(work, 'mailbox-'));
+    const unread = join(root, SID, 'unread');
+    if (opts.enabled !== false) mkdirSync(unread, { recursive: true });
+    const rec = recordingExec({ stdout: 'resumed headless' });
+    let polls = 0;
+    const adapter = createZcodeAdapter({
+      dbFile: NO_DB,
+      exec: rec.exec,
+      engineBin: '/opt/zcode/bin/zcode',
+      configFile: NO_CONFIG,
+      mailboxRoot: root,
+      isBusy: () => opts.busy(),
+      pollMs: 3,
+      sleep: async (ms) => {
+        expect(ms).toBe(3);
+        polls++;
+        opts.onPoll?.(unread);
+      },
+      ...(opts.deliverTimeoutMs !== undefined ? { deliverTimeoutMs: opts.deliverTimeoutMs } : {}),
+    });
+    return { adapter, root, unread, runs: rec.runs, polls: () => polls };
+  }
+  /** What ZCode does when it drains: move every unread letter to read/. */
+  const drainInto = (read: string[]) => (unread: string) => {
+    for (const name of readdirSync(unread)) {
+      read.push(readFileSync(join(unread, name), 'utf8'));
+      renameSync(join(unread, name), join(unread, '..', `taken-${name}`));
+    }
   };
 
-  it('honors the machine owner opt-in from config.json', async () => {
-    const cfg = join(dir, 'config.json');
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(cfg, JSON.stringify({ zcode: { deliverMode: 'yolo' } }));
-    const exec = vi.fn(okExec);
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/x/zcode.cjs', exec, configFile: cfg });
-    await a.deliver(SESS, 'E');
-    expect(modeOf(exec.mock.calls as never)).toBe('yolo');
+  it('the letter is picked up: delivered in-session, no headless turn, reply by command', async () => {
+    const letters: string[] = [];
+    const r = rig({ busy: () => true, onPoll: drainInto(letters) });
+    expect(r.adapter.replyChannel?.(target)).toBe('command');
+    expect(await r.adapter.deliver(target, 'THE ENVELOPE')).toEqual({ ok: true, output: '', inSession: true });
+    expect(r.runs).toEqual([]);
+    expect(letters).toHaveLength(1);
+    const letter = JSON.parse(letters[0]!);
+    expect(letter).toMatchObject({ version: 1, fromSessionId: 'anytoany', toSessionId: SID, content: 'THE ENVELOPE' });
+    expect(letter.messageId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(Number.isNaN(Date.parse(letter.createdAt))).toBe(false);
   });
 
-  it('rejects unknown modes and falls back to build', async () => {
-    const cfg = join(dir, 'config-bad.json');
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(cfg, JSON.stringify({ zcode: { deliverMode: 'root-me-please' } }));
-    const exec = vi.fn(okExec);
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/x/zcode.cjs', exec, configFile: cfg });
-    await a.deliver(SESS, 'E');
-    expect(modeOf(exec.mock.calls as never)).toBe('build');
+  it('the turn ends with the letter unread: it is taken back and delivered headless, once', async () => {
+    let checks = 0;
+    const r = rig({ busy: () => checks++ < 2 });
+    expect(await r.adapter.deliver(target, 'E')).toEqual({ ok: true, output: 'resumed headless' });
+    expect(r.polls()).toBe(2);
+    expect(r.runs).toHaveLength(1);
+    expect(readdirSync(r.unread)).toEqual([]);
   });
 
-  it('defaults to build when no config exists', async () => {
-    const exec = vi.fn(okExec);
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/x/zcode.cjs', exec, configFile: join(dir, 'nope.json') });
-    await a.deliver(SESS, 'E');
-    expect(modeOf(exec.mock.calls as never)).toBe('build');
+  it('the budget runs out while the turn goes on: taken back, delivered headless', async () => {
+    const r = rig({ busy: () => true, deliverTimeoutMs: -1 });
+    expect(await r.adapter.deliver(target, 'E')).toEqual({ ok: true, output: 'resumed headless' });
+    expect(r.polls()).toBe(1);
+    expect(readdirSync(r.unread)).toEqual([]);
   });
-});
 
-describe('per-machine turn timeout', () => {
-  it('honors deliverTimeoutSec within sane bounds; rejects silly values', async () => {
-    const { writeFileSync } = await import('node:fs');
-    const cfg = join(dir, 'config-timeout.json');
-    const seen: number[] = [];
-    const exec: ExecFn = async (_c, _a, opts) => {
-      seen.push(opts.timeoutMs);
-      return { stdout: 'ok', stderr: '', code: 0 };
-    };
-    const a = createZcodeAdapter({ dbFile: join(dir, 'unused.sqlite'), engineBin: '/x/zcode.cjs', exec, configFile: cfg });
+  it('ZCode grabs the letter at the moment we try to take it back: still delivered in-session', async () => {
+    let checks = 0;
+    const r = rig({
+      busy: () => {
+        checks++;
+        if (checks === 2) drainInto([])(join(r.root, SID, 'unread'));
+        return checks < 2;
+      },
+    });
+    expect(await r.adapter.deliver(target, 'E')).toEqual({ ok: true, output: '', inSession: true });
+    expect(r.runs).toEqual([]);
+  });
 
-    writeFileSync(cfg, JSON.stringify({ zcode: { deliverMode: 'build', deliverTimeoutSec: 900 } }));
-    await a.deliver(SESS, 'E');
-    expect(seen[0]).toBe(900_000);
+  it('an idle session, or a busy one whose mailbox is off, gets the headless turn and marker replies', async () => {
+    const idleRig = rig({ busy: () => false });
+    expect(idleRig.adapter.replyChannel?.(target)).toBe('marker');
+    await idleRig.adapter.deliver(target, 'E');
+    expect(idleRig.runs).toHaveLength(1);
+    expect(readdirSync(idleRig.unread)).toEqual([]);
 
-    writeFileSync(cfg, JSON.stringify({ zcode: { deliverTimeoutSec: 5 } })); // below floor
-    await a.deliver(SESS, 'E');
-    expect(seen[1]).toBe(300_000);
+    const offRig = rig({ enabled: false, busy: () => true });
+    expect(offRig.adapter.replyChannel?.(target)).toBe('marker');
+    await offRig.adapter.deliver(target, 'E');
+    expect(offRig.runs).toHaveLength(1);
+    expect(existsSync(join(offRig.root, SID))).toBe(false);
+  });
+
+  it('a letter that cannot be written falls back to the headless turn', async () => {
+    const r = rig({ busy: () => true });
+    chmodSync(join(r.root, SID), 0o500);
+    try {
+      expect(await r.adapter.deliver(target, 'E')).toEqual({ ok: true, output: 'resumed headless' });
+      expect(r.polls()).toBe(0);
+    } finally {
+      chmodSync(join(r.root, SID), 0o700);
+    }
+  });
+
+  it('replyChannel and the delivery right after it take the same route', async () => {
+    let busy = true;
+    let checks = 0;
+    const r = rig({
+      busy: () => {
+        checks++;
+        return busy;
+      },
+      onPoll: drainInto([]),
+    });
+    expect(r.adapter.replyChannel?.(target)).toBe('command');
+    busy = false; // the turn ends between rendering the envelope and delivering it
+    expect(await r.adapter.deliver(target, 'E')).toEqual({ ok: true, output: '', inSession: true });
+    expect(checks).toBe(1);
   });
 });

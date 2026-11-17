@@ -1,40 +1,51 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { morseHome, dataDir } from '../home.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { dataDir } from '../home.js';
 import { daemonLockState, type DaemonLockState } from '../platform/daemon-lock.js';
 
-const pidFile = (): string => join(dataDir(), 'daemon.pid');
+// The daemon records its process id in `<data>/daemon.pid` (plain decimal text) so other commands can find it.
 
-export function writePid(pid: number = process.pid): void {
-  const path = pidFile();
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, String(pid), 'utf8');
+function pidPath(): string {
+  return path.join(dataDir(), 'daemon.pid');
 }
 
+/** Record `pid` (default: this process) as the running daemon. */
+export function writePid(pid: number = process.pid): void {
+  const file = pidPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${pid}`, 'utf8');
+}
+
+/** The recorded daemon pid, or null when there is no readable pid file. */
 export function readPid(): number | null {
+  let text: string;
   try {
-    const n = Number.parseInt(readFileSync(pidFile(), 'utf8').trim(), 10);
-    return Number.isFinite(n) ? n : null;
+    text = fs.readFileSync(pidPath(), 'utf8');
   } catch {
     return null;
   }
+  const pid = Number.parseInt(text.trim(), 10);
+  return Number.isNaN(pid) ? null : pid;
 }
 
-/** Remove the pid file. With ownPid, only if this process is the recorded owner. */
+/**
+ * Delete the pid file. Given `ownPid`, delete it only while it still records that pid,
+ * so a process that lost the race to start never removes the winner's file.
+ */
 export function clearPid(ownPid?: number): void {
+  if (ownPid !== undefined && readPid() !== ownPid) return;
   try {
-    if (ownPid !== undefined && readPid() !== ownPid) return;
-    rmSync(pidFile());
+    fs.rmSync(pidPath(), { force: true });
   } catch {
-    /* already gone */
+    // unremovable: leave it; readers check liveness anyway
   }
 }
 
+/** Does a process with this pid exist (signal 0 probe)? */
 export function isAlive(pid: number): boolean {
   try {
-    process.kill(pid, 0);
-    return true;
+    return process.kill(pid, 0);
   } catch {
     return false;
   }
@@ -55,7 +66,7 @@ export function commandLineOf(pid: number): string | null {
   if (process.platform === 'win32' || !Number.isInteger(pid) || pid <= 0) return null;
   if (process.platform === 'linux') {
     try {
-      const args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+      const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
       if (args.length) return args.join(' ');
     } catch {
       /* no /proc here, or no such process: ps says */
