@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -25,7 +26,9 @@ export function patchLaunchdPlist(text: string, label: string = LAUNCHD_LABEL): 
   if (!new RegExp(`<key>Label</key>\\s*<string>${label.replace(/\./g, '\\.')}</string>`).test(text)) return null;
   if (/<key>ExitTimeOut<\/key>/.test(text)) return null;
   // where the installer puts it: after ThrottleInterval — else before the end of the top-level dictionary
-  const throttle = /^[ \t]*<key>ThrottleInterval<\/key>.*\n/m.exec(text);
+  // the key AND its value: a plist rewritten by plutil / defaults has them on separate lines, and a new key
+  // between the two would make the whole file unreadable for launchd
+  const throttle = /^[ \t]*<key>ThrottleInterval<\/key>\s*<integer>[^<]*<\/integer>[ \t]*\n/m.exec(text);
   if (throttle) return text.slice(0, throttle.index + throttle[0].length) + PLIST_LINE + text.slice(throttle.index + throttle[0].length);
   const end = text.lastIndexOf('</dict>');
   return end === -1 ? null : text.slice(0, end) + PLIST_LINE + text.slice(end);
@@ -55,6 +58,18 @@ export interface ServiceFileOptions {
   env?: NodeJS.ProcessEnv;
   /** Told to re-read unit files after a unit was rewritten (default: `systemctl --user daemon-reload`). */
   reload?: () => void;
+  /** macOS: is this plist text valid? (default: `plutil -lint -`; a missing plutil counts as valid) */
+  lintPlist?: (text: string) => boolean;
+}
+
+/** `plutil -lint` on the text — what launchd will be able to read. No plutil (not macOS): no opinion. */
+function plutilLint(text: string): boolean {
+  try {
+    execFileSync('/usr/bin/plutil', ['-lint', '-'], { input: text, stdio: ['pipe', 'ignore', 'ignore'], timeout: 5000 });
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT';
+  }
 }
 
 export type ServiceFileOutcome = { outcome: 'patched' | 'ok' | 'absent' | 'not-ours' | 'error'; file: string | null; detail?: string };
@@ -81,6 +96,8 @@ export function ensureServiceFileTimeouts(opts: ServiceFileOptions = {}): Servic
       const ours = platform === 'darwin' ? before.includes(`<string>${LAUNCHD_LABEL}</string>`) : before.includes('[Service]');
       return { outcome: ours ? 'ok' : 'not-ours', file };
     }
+    // never write a plist launchd could not read: the daemon would not start at the next login
+    if (platform === 'darwin' && !(opts.lintPlist ?? plutilLint)(after)) return { outcome: 'error', file, detail: 'the patched plist does not pass plutil -lint; left as it was' };
     writeFileAtomic(file, after, { mode: statSync(file).mode & 0o777 });
     if (platform === 'linux') {
       try {

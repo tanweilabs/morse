@@ -2,6 +2,11 @@
 
 重大变更按时间倒序记在这里，最新的在最上面；每条是 `## YYYY-MM-DD — 标题` 加要点。
 
+## 2026-11-20 — 修复：plist 被 plutil 改写过后，补 ExitTimeOut 会把它写坏
+
+- **问题**（同事报告）：daemon 启动时给旧的 `talk.morse.daemon.plist` 补 `ExitTimeOut`（ADR-089），原来假定 `<key>ThrottleInterval</key>` 和它的值在同一行。plist 只要被 `plutil` / `defaults` 改写过，就变成键一行、值一行，新键会插到两者中间，plist 解析失败；正在跑的 daemon 不受影响，但下次登录或重启后 launchd 读不了，daemon 起不来。
+- **修复**：`src/update/service-file.ts` 匹配 ThrottleInterval 时连同它的 `<integer>…</integer>` 一起（中间允许换行）；写之前用 `plutil -lint` 校验，不通过就不写、原文件不动。新增两个测试（多行、制表符缩进的 plist；校验不通过不落盘）。
+
 ## 2026-11-17 — 换掉剩下的 anytoany 代码（ADR-093）
 
 - **维护者拍板**：公开导出里仍归原作者（Erix）的代码、测试和文档，全部换成 Morse 自己写的，行为不变；目标是以后不再需要 MIT 声明。`LICENSE-MIT`、`NOTICE` 这次不删，由维护者看过结果再定。

@@ -66,6 +66,24 @@ describe('an existing install gets the stop timeouts: our own service file, fixe
     expect(patchLaunchdPlist(bare)).toBe(bare.replace('</dict>\n</plist>', '  <key>ExitTimeOut</key><integer>30</integer>\n</dict>\n</plist>'));
   });
 
+  it('launchd: a plist rewritten by plutil / defaults (key and value on separate lines, tabs) stays valid — the new key never lands between a key and its value', () => {
+    // what `plutil -convert xml1` writes: one element per line, tab-indented
+    const multiline = PLIST_BEFORE.replace(/^( *)<key>([^<]+)<\/key>(<[^\n]+)$/gm, (_m, _sp, key: string, value: string) => `\t<key>${key}</key>\n\t${value}`);
+    expect(multiline).toContain('<key>ThrottleInterval</key>\n\t<integer>10</integer>');
+    const out = patchLaunchdPlist(multiline)!;
+    expect(out).toContain('<key>ThrottleInterval</key>\n\t<integer>10</integer>\n');
+    expect(out).not.toMatch(/<key>ThrottleInterval<\/key>\s*<key>/);
+    // every key is directly followed by its value (no key-key pairs)
+    expect(out.match(/<key>[^<]*<\/key>\s*<key>/g)).toBeNull();
+    expect(out).toContain('<key>ExitTimeOut</key><integer>30</integer>');
+    expect(patchLaunchdPlist(out)).toBeNull();
+    // a dictionary nested inside (e.g. EnvironmentVariables) is not the end of the top-level one
+    const nested = multiline.replace('\t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n', '');
+    const outNested = patchLaunchdPlist(nested)!;
+    expect(outNested.match(/<key>[^<]*<\/key>\s*<key>/g)).toBeNull();
+    expect(outNested.indexOf('<key>ExitTimeOut</key>')).toBeGreaterThan(outNested.lastIndexOf('</dict>', outNested.lastIndexOf('</dict>') - 1));
+  });
+
   it('systemd: the older unit becomes exactly the one the installer writes now; only what is missing is added', () => {
     expect(patchSystemdUnit(UNIT_BEFORE)).toBe(UNIT_NOW);
     expect(patchSystemdUnit(UNIT_NOW)).toBeNull();
@@ -118,6 +136,19 @@ describe('an existing install gets the stop timeouts: our own service file, fixe
     const plist = serviceFilePath({ platform: 'darwin', home })!;
     mkdirSync(plist, { recursive: true }); // a directory where the file should be
     expect(ensureServiceFileTimeouts({ platform: 'darwin', home }).outcome).toBe('error');
+  });
+
+  it('macOS: a patched plist that would not pass plutil -lint is never written — the file stays as it was', () => {
+    const home = tmp();
+    const plist = serviceFilePath({ platform: 'darwin', home })!;
+    mkdirSync(join(home, 'Library', 'LaunchAgents'), { recursive: true });
+    writeFileSync(plist, PLIST_BEFORE);
+    const seen: string[] = [];
+    const r = ensureServiceFileTimeouts({ platform: 'darwin', home, lintPlist: (t) => (seen.push(t), false) });
+    expect(r.outcome).toBe('error');
+    expect(r.detail).toContain('plutil -lint');
+    expect(seen).toEqual([PLIST_NOW]);
+    expect(readFileSync(plist, 'utf8')).toBe(PLIST_BEFORE);
   });
 });
 

@@ -4,6 +4,10 @@ Notable changes, newest first. Morse is pre-release, and several AI agents build
 
 ## Unreleased
 
+### Fix: a plist rewritten by plutil no longer breaks at the next login
+
+- The daemon's start adds `ExitTimeOut` to an older `talk.morse.daemon.plist` (ADR-089). It assumed `<key>ThrottleInterval</key>` and its value sit on one line; after `plutil` or `defaults` rewrote the plist they are on two, the new key landed between them and launchd could no longer read the file — the running daemon was fine, but it did not start again after a logout or restart. The patch now takes the key and its value together, and a patched plist that does not pass `plutil -lint` is not written (reported by a user).
+
 ### The remaining anytoany code is replaced (ADR-093)
 
 - Every part of the public tree still written by the original anytoany author is rewritten as Morse's own code with the same behaviour: the delivery adapters, the daemon's local API and dispatcher, the mailbox, external agents and the 闪电说 integration, the Claude doorbell and session liveness, device identity and trust, the CLI's older command wiring, the prompt hook, doctor and setup, the web console, the skills' wording, CI, configs. His tests are replaced by new ones (2035 → 2158 tests).
